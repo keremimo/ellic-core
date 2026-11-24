@@ -746,6 +746,33 @@ void motion() {
         CHECK(copy_bank->at[2][5].motion == r.motion && copy_bank->at[2][6].motion == mixed.motion);
     }
 
+    // Played: a ramp from silence up to full makes more sound than the same points holding, less than none at all.
+    auto ramped = [](int how) { // 0: no motion; 1: points that hold; 2: the first a ramp
+        auto project = std::make_unique<Project>();
+        auto bank = std::make_unique<PatternBank>();
+        tone_kit(*project, 0);
+        for (unsigned s = 0; s < 16; ++s) put(bank->at[0][0], s, uint8_t(sampler_first_note), 100);
+        if (how) {
+            auto first = point(0, sampler::Level, 0);
+            first.ramp = how == 2;
+            bank->at[0][0].write_motion(first);
+            bank->at[0][0].write_motion(point(4, sampler::Level, 127));
+        }
+        EngineHost host;
+        host.load(*project, *bank);
+        auto tone = tone_sample();
+        CHECK(host.offer_sample(0, &tone));
+        host.send({Command::Type::Play});
+        std::vector<int32_t> out(256);
+        double energy = 0;
+        for (unsigned n = 0; n < 160; ++n) { // to about step 3, inside the ramp
+            host.render(out.data(), 128, 1);
+            for (auto v : out) energy += double(v / 2147483648.0f) * (v / 2147483648.0f);
+        }
+        return energy;
+    };
+    double none = ramped(0), held = ramped(1), line = ramped(2);
+    CHECK(held * 4 < line && line < none);
 }
 // Freeze plan F3: an audio track's take lives in its pattern (a pattern with one is not empty) and goes through a
 // file with the track's settings; a take on a track that is not an audio track is dropped.
