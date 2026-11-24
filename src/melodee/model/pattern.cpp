@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Kerem Kilic (Ellic Studio)
 #include "melodee/model/pattern.h"
+#include <unordered_map>
 #include <cmath>
 
 namespace melodee {
@@ -78,6 +79,7 @@ void Pattern::set_step(unsigned s, const Step& value) {
 void Pattern::sort() { std::stable_sort(events.begin(), events.end(), before); }
 
 void Pattern::cut(uint32_t tick) {
+    ramp_plan.planned = false;
     events.erase(events.begin() + long(lower(tick)), events.end());
     motion.erase(motion.begin() + long(motion_lower(tick)), motion.end());
     punches.erase(std::remove_if(punches.begin(), punches.end(), [tick](const PatternPunch& e) { return e.tick >= tick; }), punches.end()); // pad-fx C
@@ -86,6 +88,7 @@ void Pattern::cut(uint32_t tick) {
 
 bool Pattern::clear_notes_and_motion() {
     if (events.empty() && motion.empty()) return false;
+    ramp_plan.planned = false;
     events.clear();
     motion.clear();
     return true;
@@ -98,6 +101,7 @@ bool motion_before(const MotionPoint& a, const MotionPoint& b) {
 } // namespace
 
 bool Pattern::write_motion(const MotionPoint& m) {
+    ramp_plan.planned = false; // a plan holds for the points it was made for
     auto at = std::lower_bound(motion.begin(), motion.end(), m, motion_before);
     if (at != motion.end() && at->tick == m.tick && at->on(m.param, m.pad)) { *at = m; return true; }
     if (motion.size() >= motion_points) return false;
@@ -106,6 +110,7 @@ bool Pattern::write_motion(const MotionPoint& m) {
 }
 
 bool Pattern::clear_lane(unsigned param, unsigned pad) {
+    ramp_plan.planned = false;
     auto before = motion.size();
     motion.erase(std::remove_if(motion.begin(), motion.end(), [&](const MotionPoint& m) { return m.on(param, pad); }), motion.end());
     return motion.size() != before;
@@ -124,12 +129,120 @@ const MotionPoint* Pattern::lock_at(uint32_t tick, unsigned param, unsigned pad)
 }
 
 int Pattern::lane_value(uint32_t tick, unsigned param, unsigned pad, int own) const {
-    for (size_t n = std::min(motion_lower(tick + 1), motion.size()); n-- > 0;)
-        if (motion[n].on(param, pad) && !motion[n].lock()) return motion[n].value;
-    return own;
+    for (size_t n = std::min(motion_lower(tick + 1), motion.size()); n-- > 0;) {
+        if (!motion[n].on(param, pad) || motion[n].lock()) continue;
+        size_t to = planned_ramp_end(n); // looked up on a planned copy (the audio thread's), else worked out
+        return to < motion.size() ? ramp_value(motion[n], motion[to], tick) : motion[n].value;
+    }
+    // Before the first point: its value, when it was set by hand (a planned copy keeps those points in its leads).
+    if (ramps_planned()) {
+        for (uint32_t n : ramp_plan.leads)
+            if (n < motion.size() && motion[n].on(param, pad)) return motion[n].value;
+        return own;
+    }
+    const MotionPoint* first = first_point(param, pad);
+    return first && first->ramp ? first->value : own;
 }
 
-void Pattern::sort_motion() { std::stable_sort(motion.begin(), motion.end(), motion_before); }
+const MotionPoint* Pattern::first_point(unsigned param, unsigned pad) const {
+    for (const auto& m : motion) {
+        if (m.tick > length) break;
+        if (m.on(param, pad) && !m.lock() && m.within(length)) return &m;
+    }
+    return nullptr;
+}
+
+size_t Pattern::ramp_end(size_t n) const {
+    if (n >= motion.size() || !motion[n].ramp || motion[n].lock()) return motion.size();
+    const auto& from = motion[n];
+    for (size_t k = n + 1; k < motion.size() && motion[k].tick <= length; ++k)
+        if (motion[k].on(from.param, from.pad) && !motion[k].lock()) return motion[k].tick > from.tick ? k : motion.size();
+    return motion.size();
+}
+
+std::vector<uint32_t> Pattern::ramp_ends() const {
+    std::vector<uint32_t> ends(motion.size(), uint32_t(motion.size()));
+    std::unordered_map<uint16_t, uint32_t> next; // a lane (param, pad): its next point after the one in hand, locks aside
+    for (size_t n = motion.size(); n-- > 0;) {
+        const auto& m = motion[n];
+        if (m.lock()) continue;
+        uint16_t lane = uint16_t(m.param << 8 | m.pad);
+        if (m.ramp)
+            if (auto it = next.find(lane); it != next.end() && motion[it->second].tick > m.tick) ends[n] = it->second;
+        if (m.tick <= length) next[lane] = uint32_t(n); // past the end: no ramp goes there
+    }
+    return ends;
+}
+
+int Pattern::ramp_value(uint32_t from, int a, uint32_t to, int b, uint32_t tick) {
+    if (tick <= from || to <= from) return a;
+    if (tick >= to) return b;
+    int64_t span = int64_t(to - from), along = int64_t(tick - from), rise = int64_t(b) - a;
+    int64_t step = rise * along * 2 / span; // twice the rise so far, to round half away from zero
+    return a + int((step + (step < 0 ? -1 : 1)) / 2);
+}
+
+const MotionPoint* Pattern::point_at(uint32_t tick, unsigned param, unsigned pad) const {
+    for (size_t n = motion_lower(tick); n < motion.size() && motion[n].tick == tick; ++n)
+        if (motion[n].on(param, pad) && !motion[n].lock()) return &motion[n];
+    return nullptr;
+}
+
+bool Pattern::erase_point(uint32_t tick, unsigned param, unsigned pad) {
+    auto* m = point_at(tick, param, pad);
+    if (!m) return false;
+    ramp_plan.planned = false;
+    motion.erase(motion.begin() + (m - motion.data()));
+    return true;
+}
+
+bool Pattern::move_point(uint32_t tick, uint32_t to, unsigned param, unsigned pad) {
+    auto* m = point_at(tick, param, pad);
+    if (!m || to > length) return false;
+    if (to == tick) return true;
+    for (size_t n = motion_lower(to); n < motion.size() && motion[n].tick == to; ++n)
+        if (motion[n].on(param, pad)) return false; // the lane holds one there already (a lock too)
+    MotionPoint moved = *m;
+    moved.tick = to;
+    motion.erase(motion.begin() + (m - motion.data()));
+    return write_motion(moved); // drops the plan
+}
+
+unsigned Pattern::ramps_at_once() const {
+    std::vector<std::pair<uint32_t, int>> edges; // +1 where a ramp starts, -1 where it ends (ends first on a tick)
+    auto ends = ramp_ends();
+    for (size_t n = 0; n < motion.size(); ++n)
+        if (size_t to = ends[n]; to < motion.size()) { edges.push_back({motion[n].tick, 1}); edges.push_back({motion[to].tick, -1}); }
+    std::sort(edges.begin(), edges.end());
+    int now = 0, most = 0;
+    for (const auto& e : edges) most = std::max(most, now += e.second);
+    return unsigned(most);
+}
+
+void Pattern::plan_ramps() {
+    ramp_plan = {};
+    ramp_plan.planned = true;
+    ramp_plan.points = uint32_t(motion.size());
+    bool any = false;
+    for (const auto& m : motion) any |= m.ramp && !m.lock();
+    if (!any) return;
+    ramp_plan.ends = ramp_ends();
+    std::vector<bool> seen(256 * 256); // a lane: param, pad
+    for (size_t n = 0; n < motion.size(); ++n) {
+        const auto& m = motion[n];
+        if (m.tick > length) break;
+        if (m.lock() || !m.within(length)) continue;
+        size_t lane = size_t(m.param) * 256 + m.pad;
+        if (seen[lane]) continue;
+        seen[lane] = true;
+        if (m.ramp && m.tick > 0) ramp_plan.leads.push_back(uint32_t(n));
+    }
+}
+
+void Pattern::sort_motion() {
+    ramp_plan.planned = false;
+    std::stable_sort(motion.begin(), motion.end(), motion_before);
+}
 
 void Pattern::set_lane_length(unsigned key, uint32_t ticks) {
     lanes.erase(std::remove_if(lanes.begin(), lanes.end(), [&](const LaneLength& l) { return l.key == key; }), lanes.end());
@@ -145,11 +258,18 @@ void Pattern::fit_lanes() {
 
 bool double_pattern(Pattern& p, uint32_t max_length, bool copy) {
     if (p.length * 2 > max_length) return false;
+    std::vector<MotionPoint> ends; // points on the end: the first half's, and with a copy the new end's too
+    for (size_t n = p.motion_lower(p.length); n < p.motion.size() && p.motion[n].tick == p.length; ++n)
+        if (p.motion[n].within(p.length)) ends.push_back(p.motion[n]);
     p.cut(p.length); // nothing hidden past the end comes back
     size_t count = copy ? p.events.size() : 0;
     for (size_t n = 0; n < count && p.events.size() < max_pattern_events; ++n) { Event e = p.events[n]; e.tick += p.length; p.events.push_back(e); }
     size_t points = copy ? p.motion.size() : 0; // its motion too, as far as there is room
     for (size_t n = 0; n < points && p.motion.size() < motion_points; ++n) { MotionPoint m = p.motion[n]; m.tick += p.length; p.motion.push_back(m); }
+    for (auto m : ends) {
+        if (!p.point_at(m.tick, m.param, m.pad) && !p.lock_at(m.tick, m.param, m.pad)) p.write_motion(m); // the copy's own point or lock there plays instead
+        if (copy) { m.tick += p.length; p.write_motion(m); }
+    }
     size_t kept = copy ? p.punches.size() : 0; // and its kept punches (pad-fx C)
     for (size_t n = 0; n < kept && p.punches.size() < max_pattern_punches; ++n) { PatternPunch e = p.punches[n]; e.tick += p.length; p.punches.push_back(e); }
     p.length *= 2;
@@ -186,10 +306,10 @@ void scale_pattern(Pattern& p, bool slower) {
     for (const auto& e : moved) p.add(e);
     std::vector<MotionPoint> points; // its motion with them
     for (auto m : p.motion) {
-        if (m.tick >= p.length) continue; // hidden past the end: not brought in at double speed, as the notes
+        if (!m.within(p.length)) continue; // hidden past the end: not brought in at double speed, as the notes
         m.tick = slower ? m.tick * 2 : m.tick / 2;
         if (m.hold) m.hold = note_ticks(slower ? uint64_t(m.hold) * 2 : m.hold / 2u);
-        if (m.tick < p.length) points.push_back(m);
+        if (m.within(p.length)) points.push_back(m);
     }
     p.motion.clear();
     for (const auto& m : points) p.write_motion(m);
@@ -282,8 +402,8 @@ Pattern speed_pattern(const Pattern& p, unsigned speed) {
     }
     out.motion.clear();
     for (auto m : p.motion) {
-        if (m.tick >= p.length) continue; // hidden past the end: not played on the last tick
-        m.tick = uint32_t(std::min<uint64_t>(scale(m.tick), out.length - 1));
+        if (!m.within(p.length)) continue; // hidden past the end: not played on the last tick
+        m.tick = m.tick == p.length ? out.length : uint32_t(std::min<uint64_t>(scale(m.tick), out.length - 1)); // the end stays the end
         if (m.hold) m.hold = held(m.hold);
         out.write_motion(m);
     }
@@ -299,7 +419,11 @@ Pattern speed_pattern(const Pattern& p, unsigned speed) {
     return out;
 }
 
-Pattern played_pattern(const Pattern& p, unsigned speed) { return speed_pattern(feel_pattern(p), speed); }
+Pattern played_pattern(const Pattern& p, unsigned speed) {
+    Pattern out = speed_pattern(feel_pattern(p), speed);
+    out.plan_ramps(); // for the audio thread, which only looks it up
+    return out;
+}
 
 void groove_of(const Pattern& source, Feel& feel) {
     unsigned step = std::max<unsigned>(feel.groove_step, 1);

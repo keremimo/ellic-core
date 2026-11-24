@@ -130,16 +130,37 @@ struct Step {
 // A point of Motion (roadmap P1: kept by its pattern, at tick resolution): from `tick` on, a lane holds `value`. A
 // lane is an engine parameter, an effect's on the track's chain or the mod wheel (`param`, model/limits.h's
 // motion_* numbers), or a kit pad's own value on `pad`. A lock (`hold` above 0: a pot turned with a step or note
-// held) holds for that many ticks only, then the lane goes back to what it was.
+// held) holds for that many ticks only, then the lane goes back to what it was. A ramp (`ramp`: a point set by hand
+// on Motion) does not hold: from its tick the lane goes in a straight line to the lane's next point (locks aside)
+// up to the pattern's end, and holds when there is none. A lane whose first point is a ramp holds that point's
+// value from the pattern's start. A point on the end itself (`tick` == the pattern's length, not a lock) is never
+// played: it is where the ramp before it ends, the value the lane reaches as the pattern comes round.
 struct MotionPoint {
     uint32_t tick = 0;
     uint8_t param = 0, pad = 0;
     int16_t value = 0;
     uint32_t hold = 0; // 0..max_pattern_ticks
+    bool ramp = false;
     bool lock() const { return hold > 0; }
     bool on(unsigned p, unsigned k) const { return param == p && pad == k; }
-    bool operator==(const MotionPoint& o) const { return tick == o.tick && param == o.param && pad == o.pad && value == o.value && hold == o.hold; }
+    bool operator==(const MotionPoint& o) const {
+        return tick == o.tick && param == o.param && pad == o.pad && value == o.value && hold == o.hold && ramp == o.ramp;
+    }
     bool operator!=(const MotionPoint& o) const { return !(*this == o); }
+    // Inside a pattern of `length` ticks: before its end, or a point on the end itself.
+    bool within(uint32_t length) const { return tick < length || (tick == length && !lock()); }
+};
+
+// What the audio thread needs of a pattern's ramps, worked out beforehand on another thread (Pattern::plan_ramps(),
+// which played_pattern() runs): each point's ramp_end(), and the points that set their lane from the pattern's start
+// (the first of their lane, a ramp, after tick 0). Not saved or compared. An edit through the Pattern's own calls
+// drops it (write_motion, erase_point, move_point, clear_lane, cut, sort_motion), and it holds only for as many
+// points as it was made for (ramps_planned()): a copy edited after it was planned is never read with a stale one.
+struct RampPlan {
+    bool planned = false;
+    uint32_t points = 0;         // motion.size() when it was made
+    std::vector<uint32_t> ends;  // per point of motion, its ramp_end(); empty when no point is a ramp
+    std::vector<uint32_t> leads; // by tick
 };
 
 // A kit lane of its own length (roadmap P1, polymeter inside a kit): `key`'s notes loop over `length` ticks from
@@ -245,6 +266,7 @@ struct Pattern {
     // Free length (shell/free_length.h): while it is empty, its first take sets its length, a bar at a time. K1 to
     // a number of bars, Half or Double Seq, or a launch that gives it a length turn it off.
     bool free = true;
+    RampPlan ramp_plan;                      // its ramps worked out for the audio thread (played_pattern())
 
     unsigned q() const { return division_ticks(division); }
     // Steps of Q the pattern holds (a last part step counts).
@@ -292,8 +314,41 @@ struct Pattern {
     bool has_lane(unsigned param, unsigned pad) const { return lane_points(param, pad) > 0; }
     // The lock on a lane at `tick`, if one starts there.
     const MotionPoint* lock_at(uint32_t tick, unsigned param, unsigned pad) const;
-    // What a lane holds at `tick` as recorded (locks aside): the last point at or before it, else `own`.
+    // What a lane holds at `tick` as recorded (locks aside): the last point at or before it (on its way to the next
+    // when it is a ramp); before the first, that one's value when it is a ramp (set by hand: the lane holds it from
+    // the pattern's start), else `own`.
     int lane_value(uint32_t tick, unsigned param, unsigned pad, int own) const;
+    // A lane's first point (locks aside) up to the pattern's end, if any.
+    const MotionPoint* first_point(unsigned param, unsigned pad) const;
+    // Where the ramp from point `n` goes: the next point on its lane (locks aside) up to the pattern's end (one on
+    // the end too), else motion.size() (it holds). Points that are not ramps go nowhere.
+    size_t ramp_end(size_t n) const;
+    // ramp_end() of every point at once, in one pass (for drawing and planning a whole pattern).
+    std::vector<uint32_t> ramp_ends() const;
+    // A ramp's value at `tick`, from `a` at `from` to `b` at `to` (rounded to the nearest); and between two points.
+    static int ramp_value(uint32_t from, int a, uint32_t to, int b, uint32_t tick);
+    static int ramp_value(const MotionPoint& from, const MotionPoint& to, uint32_t tick) {
+        return ramp_value(from.tick, from.value, to.tick, to.value, tick);
+    }
+    // Motion edited by hand: the point (not a lock) on a lane at `tick`, if one is there; that point taken out; or
+    // moved to `to` (false when another point of the lane is there, or it is past the pattern's end; on it is kept).
+    const MotionPoint* point_at(uint32_t tick, unsigned param, unsigned pad) const;
+    MotionPoint* point_at(uint32_t tick, unsigned param, unsigned pad) {
+        return const_cast<MotionPoint*>(static_cast<const Pattern&>(*this).point_at(tick, param, pad));
+    }
+    bool erase_point(uint32_t tick, unsigned param, unsigned pad);
+    bool move_point(uint32_t tick, uint32_t to, unsigned param, unsigned pad);
+    // The most lanes going in a line at any one tick (at most motion_ramps_at_once play: an edit keeps under it).
+    unsigned ramps_at_once() const;
+    // The audio thread's: ramp_plan worked out (any thread but the audio thread); whether it holds for the points
+    // there are now; and ramp_end() looked up in it (worked out afresh when it does not: never on the audio thread,
+    // which plays no ramps of a pattern not planned).
+    void plan_ramps();
+    bool ramps_planned() const { return ramp_plan.planned && ramp_plan.points == motion.size(); }
+    size_t planned_ramp_end(size_t n) const {
+        if (!ramps_planned()) return ramp_end(n);
+        return n < ramp_plan.ends.size() && ramp_plan.ends[n] < motion.size() ? ramp_plan.ends[n] : motion.size();
+    }
     void sort_motion();
 
     // Kit lanes (roadmap P1): the ticks `key` loops over (its own, else the pattern's), whether it has its own, and
