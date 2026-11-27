@@ -432,8 +432,7 @@ void EngineHost::load_track(unsigned t, const Track& track) {
     slot.out_was = slot.out; // loaded: no crossing over
     for (unsigned b = 0; b < bus_count; ++b) { slot.sends[b] = track.mix.sends[b] / 100.0f; slot.mix_sends[b] = track.mix.sends[b]; }
     slot.mute = track.mix.mute; slot.solo = track.mix.solo;
-    slot.pattern = track.pattern;
-    slot.ramps_stale = true; // the pattern changed: its ramps worked out afresh where it plays (play_motion)
+    slot.set_pattern(track.pattern);
     slot.off = track.off; slot.off_queued = false; // sequence links: silent from the next Play
     patterns_now[t].store(slot.pattern, std::memory_order_relaxed);
     for (unsigned k = 0; k < max_slots; ++k) {
@@ -1033,7 +1032,7 @@ void EngineHost::apply(const Command& c) {
         }
         slot.off_queued = false;
         if (running && !song_mode) slot.queued = uint8_t(c.value % pattern_count);
-        else if (!song_mode) { slot.pattern = uint8_t(c.value % pattern_count); slot.queued = 255; slot.off = false; slot.ramps_stale = true; lead = slot.pattern; follow_tempo(); }
+        else if (!song_mode) { slot.set_pattern(uint8_t(c.value % pattern_count)); slot.queued = 255; slot.off = false; lead = slot.pattern; follow_tempo(); }
         patterns_now[c.track % track_count].store(slot.pattern, std::memory_order_relaxed);
         if (!running && slot.kind == EngineKind::Midi) midi_program(c.track % track_count, frame_now, false); // roadmap P4: its own program
         break;
@@ -1049,9 +1048,8 @@ void EngineHost::apply(const Command& c) {
         unsigned t = c.track % track_count;
         if (!running || song_mode || slot.pattern != c.pattern % pattern_count || slot.silent) break;
         const auto& other = slots[c.index % track_count];
-        if (c.index < track_count && c.index != t && !other.silent) slot.start = other.start; // the track it fits: from its top
-        else slot.start = tick_now - (tick_now - slot.start) % std::max<uint32_t>(patterns[t][slot.pattern]->length, 1);
-        slot.ramps_stale = true; // where it plays changed: its ramps afresh
+        if (c.index < track_count && c.index != t && !other.silent) slot.set_start(other.start); // the track it fits: from its top
+        else slot.set_start(tick_now - (tick_now - slot.start) % std::max<uint32_t>(patterns[t][slot.pattern]->length, 1));
         fit_kept(t);    // pad-fx C: its punches as it counts now
         plan_follow(t); // roadmap P5: counted from its top again
         break;
@@ -1099,9 +1097,8 @@ void EngineHost::apply(const Command& c) {
         loop_restart = true;
         for (auto& s : slots) {
             if (s.off_queued) { s.off = true; s.off_queued = false; }
-            if (s.queued != 255) { s.pattern = s.queued; s.queued = 255; s.off = false; } // a launch ends off
-            s.start = 0; s.clip = -1; s.silent = song_mode || s.off; // off (sequence links): until a launch
-            s.ramps_stale = true; // its ramps afresh where it starts
+            if (s.queued != 255) { s.set_pattern(s.queued); s.queued = 255; s.off = false; } // a launch ends off
+            s.set_start(0); s.clip = -1; s.silent = song_mode || s.off; // off (sequence links): until a launch
         }
         in_song.store(song_mode, std::memory_order_relaxed);
         {
@@ -1139,7 +1136,7 @@ void EngineHost::apply(const Command& c) {
         for (unsigned t = 0; t < track_count; ++t) {
             positions_now[t].store(-1, std::memory_order_relaxed);
             for (auto& skip : slots[t].skips) skip.key = -1;
-            if (slots[t].queued != 255) { slots[t].pattern = slots[t].queued; slots[t].queued = 255; slots[t].off = false; slots[t].ramps_stale = true; } // a launch ends off
+            if (slots[t].queued != 255) { slots[t].set_pattern(slots[t].queued); slots[t].queued = 255; slots[t].off = false; } // a launch ends off
             if (slots[t].off_queued) { slots[t].off = true; slots[t].off_queued = false; } // off waiting for its bar
             slots[t].silent = false; slots[t].clip = -1;
             slots[t].follow_do = 0; // roadmap P5
@@ -1176,7 +1173,7 @@ void EngineHost::apply(const Command& c) {
         restart_ahead();
         arp_ticks = 0; until_arp = 0; arp_origin = tick_now; // the repeats from it
         loop_restart = true;
-        for (auto& s : slots) { s.start = 0; s.ramps_stale = true; for (auto& skip : s.skips) skip.key = -1; }
+        for (auto& s : slots) { s.set_start(0); for (auto& skip : s.skips) skip.key = -1; }
         for (unsigned t = 0; t < track_count; ++t) fit_kept(t);    // pad-fx C: a kept punch the new place is not in lets go
         for (unsigned t = 0; t < track_count; ++t) plan_follow(t); // roadmap P5: counted from the patterns' top again
         tick_count.store(tick_now, std::memory_order_relaxed);
@@ -2157,7 +2154,7 @@ void EngineHost::bar_start() {
             // A MIDI track that read this launch ahead (play_ahead()) sent these already, ahead of the notes it sent.
             const bool sent = slot.kind == EngineKind::Midi && slot.ahead_bar == tick_now && slot.ahead_queued == slot.queued;
             if (slot.kind == EngineKind::Midi && slot.queued != slot.pattern && !sent) midi_all_off(t, early_frame(t)); // the old pattern's notes end
-            slot.pattern = slot.queued; slot.queued = 255; slot.start = tick_now; slot.ramps_stale = true;
+            slot.set_pattern(slot.queued, tick_now); slot.queued = 255;
             drop_kept(t); // pad-fx C: the old pattern's punches end here
             if (slot.kind == EngineKind::Midi && !sent) midi_program(t, early_frame(t), false); // roadmap P4: a pattern's own program, ahead of its notes
             patterns_now[t].store(slot.pattern, std::memory_order_relaxed);
@@ -2226,7 +2223,7 @@ void EngineHost::follow(unsigned t) {
     follows_now[t].store(follows_now[t].load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     if (to < 0) { stop_track(t); return; } // STOP
     if (slot.kind == EngineKind::Midi && unsigned(to) != slot.pattern) midi_all_off(t, early_frame(t)); // as a launch
-    slot.pattern = uint8_t(to); slot.start = tick_now; slot.ramps_stale = true;
+    slot.set_pattern(uint8_t(to), tick_now);
     drop_kept(t); // pad-fx C: the old pattern's punches end here
     if (slot.kind == EngineKind::Midi) midi_program(t, early_frame(t), false);
     patterns_now[t].store(slot.pattern, std::memory_order_relaxed);
@@ -2250,11 +2247,10 @@ void EngineHost::clips_at_bar(bool force) {
             // A clip starts, the loop came back (to its first bar, or inside it), or the clip was changed while it
             // played: its pattern from where the clip says.
             slot.clip = index;
-            slot.pattern = clip.pattern;
+            slot.set_pattern(clip.pattern);
             drop_kept(t); // pad-fx C: the clip before's punches end here
             if (slot.kind == EngineKind::Midi) midi_program(t, early_frame(t), false); // roadmap P4
-            slot.start = start;
-            slot.ramps_stale = true; // a clip entered part-way: the last pattern's ramps go, its own run from where it plays
+            slot.set_start(start);
             patterns_now[t].store(slot.pattern, std::memory_order_relaxed);
         }
     }
@@ -2296,7 +2292,7 @@ void EngineHost::mtc_place(double seconds) {
         }
     } else {
         tick_now = at;
-        for (auto& s : slots) { s.start = 0; s.ramps_stale = true; }
+        for (auto& s : slots) s.set_start(0);
         for (unsigned t = 0; t < track_count; ++t) fit_kept(t); // pad-fx C: as Locate
     }
     tick_count.store(tick_now, std::memory_order_relaxed);

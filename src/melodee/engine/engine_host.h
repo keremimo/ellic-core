@@ -504,6 +504,11 @@ private:
         std::array<Ramp, motion_ramps_at_once> ramps {};
         unsigned ramps_on = 0;
         bool ramps_stale = false; // its pattern changed, came again or moves (a launch, a song clip, Play, an edit): the ramps afresh (play_motion)
+        // What it plays and from where: written only through these, which mark its ramps stale (play_motion works
+        // them out afresh where it plays next), so no change of pattern or start leaves the last one's ramps running.
+        void set_pattern(uint8_t to) { pattern = to; ramps_stale = true; }
+        void set_start(uint32_t tick) { start = tick; ramps_stale = true; }
+        void set_pattern(uint8_t to, uint32_t tick) { set_pattern(to); set_start(tick); }
         uint32_t motion_at = UINT32_MAX; // the tick Motion played last: one not after it is a jump (ramps worked out afresh)
         float buffer[block] {};
         float left[block] {}, right[block] {};
