@@ -715,6 +715,27 @@ void motion() {
     CHECK(end.ramp_end(0) == 1 && end.lane_value(12 * sixteenth_ticks, a, 0, -1) == 40 && end.lane_value(15 * sixteenth_ticks, a, 0, -1) == 70);
     CHECK(end.move_point(16 * sixteenth_ticks, 12 * sixteenth_ticks, a, 0) && end.move_point(12 * sixteenth_ticks, end.length, a, 0));
     CHECK(!end.move_point(end.length, end.length + 1, a, 0));
+    { // A recorded point on the end (a knob turned across the bar line, a pattern shortened after recording) stays
+      // hidden past it, as before ramps: no line ends there, doubling and double speed do not bring it in, and a
+      // recorded point is not moved onto the end. Only a ramp sits on the end.
+        Pattern hidden;
+        hidden.length = 16 * sixteenth_ticks;
+        CHECK(hidden.write_motion(ramp(8, a, 0)) && hidden.write_motion(point(16, a, 80)));
+        CHECK(!hidden.motion[1].within(hidden.length) && hidden.ramp_end(0) == hidden.motion.size());
+        CHECK(hidden.ramp_ends()[0] == hidden.motion.size() && hidden.lane_value(15 * sixteenth_ticks, a, 0, -1) == 0);
+        CHECK(!hidden.move_point(8 * sixteenth_ticks, hidden.length, a, 0) || hidden.point_at(hidden.length, a, 0)->ramp);
+        Pattern held = hidden; // a recorded point before it: it does not move onto the end
+        CHECK(held.write_motion(point(4, a, 9)) && !held.move_point(4 * sixteenth_ticks, held.length, a, 0));
+        for (bool copy : {false, true}) {
+            Pattern twice = hidden;
+            CHECK(double_pattern(twice, 128 * 384, copy) && !twice.point_at(16 * sixteenth_ticks, a, 0) && !twice.point_at(32 * sixteenth_ticks, a, 0));
+        }
+        Pattern faster = hidden;
+        scale_pattern(faster, false); // double speed: the ramp to a quarter of the way, nothing in the middle
+        CHECK(faster.point_at(4 * sixteenth_ticks, a, 0) && !faster.point_at(8 * sixteenth_ticks, a, 0) && faster.motion.size() == 1);
+        auto quick = speed_pattern(hidden, 3);
+        CHECK(quick.motion.size() == 1 && !quick.point_at(quick.length, a, 0));
+    }
     {
         Pattern only; // the end point alone: set by hand, the lane holds it from the start
         only.length = end.length;
@@ -773,6 +794,44 @@ void motion() {
     };
     double none = ramped(0), held = ramped(1), line = ramped(2);
     CHECK(held * 4 < line && line < none);
+
+    { // A pattern changed part-way (a song clip changed while it plays, entered at its second bar): the last pattern's
+      // ramp stops moving the lane, which goes where the new pattern has it (here the track's own value).
+        auto project = std::make_unique<Project>();
+        auto bank = std::make_unique<PatternBank>();
+        load_sound(project->tracks[0], EngineKind::Midi, 0);
+        auto& t = project->tracks[0];
+        t.params[midi_track::Port] = midi_track::UsbC; t.params[midi_track::Channel] = 1;
+        t.params[midi_track::CcNumber1] = 74; t.params[midi_track::Cc1] = 7;
+        const uint32_t bar = project->bar_ticks();
+        auto& lined = bank->at[0][0];
+        lined.length = 2 * bar;
+        MotionPoint from; from.param = uint8_t(midi_track::Cc1); from.value = 0; from.ramp = true;
+        MotionPoint to = from; to.tick = lined.length; to.value = 120; // a line over both bars, to a point on the end
+        CHECK(lined.write_motion(from) && lined.write_motion(to));
+        bank->at[0][1].length = 2 * bar; // no motion
+        project->song.place({0, 0, 0, 2, false});
+        EngineHost host;
+        host.load(*project, *bank);
+        host.set_audio_format(44100, 384);
+        host.send({Command::Type::Play, 0, 0, 0, 1}); // the song
+        std::vector<int32_t> out(256);
+        std::vector<int> before, after;
+        auto run = [&](unsigned blocks, std::vector<int>& into) {
+            for (unsigned b = 0; b < blocks; ++b) {
+                host.render(out.data(), 128, 1);
+                MidiOutEvent e;
+                while (host.take_midi(e)) if (e.kind == MidiOutEvent::Kind::Control && e.a == 74) into.push_back(e.b);
+            }
+        };
+        run(600, before); // most of bar 1 (88200 frames a bar at 120 BPM): the line climbing
+        CHECK(before.size() > 10 && before.back() > 20 && before.back() < 60);
+        host.send([] { Command c {Command::Type::SongClip}; c.index = 0; c.clip = {0, 1, 0, 2, false}; return c; }());
+        run(250, after); // into bar 2: pattern 1 from its second bar
+        auto seven = std::find(after.begin(), after.end(), 7);
+        CHECK(seven != after.end()); // back to the track's own value
+        for (auto v = seven; v != after.end(); ++v) CHECK(*v == 7); // and no line moving it after
+    }
 }
 // Freeze plan F3: an audio track's take lives in its pattern (a pattern with one is not empty) and goes through a
 // file with the track's settings; a take on a track that is not an audio track is dropped.

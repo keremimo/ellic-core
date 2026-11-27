@@ -147,8 +147,9 @@ struct MotionPoint {
         return tick == o.tick && param == o.param && pad == o.pad && value == o.value && hold == o.hold && ramp == o.ramp;
     }
     bool operator!=(const MotionPoint& o) const { return !(*this == o); }
-    // Inside a pattern of `length` ticks: before its end, or a point on the end itself.
-    bool within(uint32_t length) const { return tick < length || (tick == length && !lock()); }
+    // Inside a pattern of `length` ticks: before its end, or a ramp on the end itself. A recorded point there (a
+    // knob turned across the bar line, a pattern shortened after recording) stays hidden past the end, as before ramps.
+    bool within(uint32_t length) const { return tick < length || (tick == length && ramp && !lock()); }
 };
 
 // What the audio thread needs of a pattern's ramps, worked out beforehand on another thread (Pattern::plan_ramps(),

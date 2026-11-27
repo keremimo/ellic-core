@@ -503,7 +503,7 @@ private:
         struct Ramp { int16_t param = -1; uint8_t pad = 0; uint32_t from = 0, to = 0; int16_t a = 0, b = 0; int32_t last = 0; };
         std::array<Ramp, motion_ramps_at_once> ramps {};
         unsigned ramps_on = 0;
-        bool ramps_stale = false; // its pattern came again while it played: the ramps are worked out afresh (play_motion)
+        bool ramps_stale = false; // its pattern changed, came again or moves (a launch, a song clip, Play, an edit): the ramps afresh (play_motion)
         uint32_t motion_at = UINT32_MAX; // the tick Motion played last: one not after it is a jump (ramps worked out afresh)
         float buffer[block] {};
         float left[block] {}, right[block] {};

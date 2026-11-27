@@ -156,7 +156,7 @@ size_t Pattern::ramp_end(size_t n) const {
     if (n >= motion.size() || !motion[n].ramp || motion[n].lock()) return motion.size();
     const auto& from = motion[n];
     for (size_t k = n + 1; k < motion.size() && motion[k].tick <= length; ++k)
-        if (motion[k].on(from.param, from.pad) && !motion[k].lock()) return motion[k].tick > from.tick ? k : motion.size();
+        if (motion[k].on(from.param, from.pad) && !motion[k].lock() && motion[k].within(length)) return motion[k].tick > from.tick ? k : motion.size();
     return motion.size();
 }
 
@@ -169,7 +169,7 @@ std::vector<uint32_t> Pattern::ramp_ends() const {
         uint16_t lane = uint16_t(m.param << 8 | m.pad);
         if (m.ramp)
             if (auto it = next.find(lane); it != next.end() && motion[it->second].tick > m.tick) ends[n] = it->second;
-        if (m.tick <= length) next[lane] = uint32_t(n); // past the end: no ramp goes there
+        if (m.within(length)) next[lane] = uint32_t(n); // hidden past the end (a recorded point on it too): no ramp goes there
     }
     return ends;
 }
@@ -198,7 +198,7 @@ bool Pattern::erase_point(uint32_t tick, unsigned param, unsigned pad) {
 
 bool Pattern::move_point(uint32_t tick, uint32_t to, unsigned param, unsigned pad) {
     auto* m = point_at(tick, param, pad);
-    if (!m || to > length) return false;
+    if (!m || to > length || (to == length && !m->ramp)) return false; // on the end: only a ramp (else it would hide)
     if (to == tick) return true;
     for (size_t n = motion_lower(to); n < motion.size() && motion[n].tick == to; ++n)
         if (motion[n].on(param, pad)) return false; // the lane holds one there already (a lock too)
