@@ -434,6 +434,17 @@ std::vector<uint8_t> save_project(const Project& project, const PatternBank& pat
                     if (m.hold > 0xffff) { w.u32(m.tick); w.u8(m.param); w.u8(m.pad); w.u32(m.hold); }
                 w.end(at);
             }
+            // The points set by hand, that go in a line to the next (older builds skip it: they hold): after MOTK and
+            // MOTS, each by its tick and lane, so it finds its point however many of them a build loads.
+            uint32_t ramps = 0;
+            for (const auto& m : pattern.motion) ramps += m.ramp && !m.lock();
+            if (ramps) {
+                at = w.begin("MOTL");
+                w.u8(t); w.u8(p); w.u32(ramps);
+                for (const auto& m : pattern.motion)
+                    if (m.ramp && !m.lock()) { w.u32(m.tick); w.u8(m.param); w.u8(m.pad); }
+                w.end(at);
+            }
         }
     }
     bool sped = false; // the tracks' playback speeds (roadmap P1), when one is not x1
@@ -1424,6 +1435,17 @@ std::string load_project(const std::vector<uint8_t>& data, Project& target, Patt
                 if (!r.ok || !hold) continue;
                 for (size_t n = pattern.motion_lower(tick); n < pattern.motion.size() && pattern.motion[n].tick == tick; ++n)
                     if (pattern.motion[n].on(param, pad) && pattern.motion[n].lock()) { pattern.motion[n].hold = note_ticks(ticks(hold)); break; }
+            }
+        } else if (name == "MOTL") { // Motion's ramps: which of the pattern's points (MOTK and MOTS before it) go in a line
+            unsigned t = r.u8(), p = r.u8();
+            if (t >= track_count || p >= pattern_count) continue;
+            auto& pattern = patterns->at[t][p];
+            uint32_t count = std::min<uint32_t>(r.u32(), motion_points);
+            for (uint32_t k = 0; k < count && r.ok; ++k) {
+                uint32_t tick = uint32_t(std::min<uint64_t>(ticks(r.u32()), max_pattern_ticks)); // in the file's ticks, as MOTK's
+                unsigned param = r.u8(), pad = r.u8() % sampler_pads;
+                if (!r.ok) break;
+                if (auto* m = pattern.point_at(tick, param, pad)) m->ramp = true; // a point not loaded: none
             }
         } else if (name == "MOTN" || name == "MOT2") { // the project's Motion before roadmap P1
             bool division = name == "MOTN";

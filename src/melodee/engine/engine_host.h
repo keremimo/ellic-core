@@ -499,6 +499,17 @@ private:
         struct Lock { int16_t param = -1; uint8_t pad = 0; uint32_t left = 0; };
         std::array<Lock, 16> locks {};
         unsigned locks_on = 0;
+        // Motion's ramps playing: a lane going in a line from `a` at tick `from` to `b` at `to`, and its value last set.
+        struct Ramp { int16_t param = -1; uint8_t pad = 0; uint32_t from = 0, to = 0; int16_t a = 0, b = 0; int32_t last = 0; };
+        std::array<Ramp, motion_ramps_at_once> ramps {};
+        unsigned ramps_on = 0;
+        bool ramps_stale = false; // its pattern changed, came again or moves (a launch, a song clip, Play, an edit): the ramps afresh (play_motion)
+        // What it plays and from where: written only through these, which mark its ramps stale (play_motion works
+        // them out afresh where it plays next), so no change of pattern or start leaves the last one's ramps running.
+        void set_pattern(uint8_t to) { pattern = to; ramps_stale = true; }
+        void set_start(uint32_t tick) { start = tick; ramps_stale = true; }
+        void set_pattern(uint8_t to, uint32_t tick) { set_pattern(to); set_start(tick); }
+        uint32_t motion_at = UINT32_MAX; // the tick Motion played last: one not after it is a jump (ramps worked out afresh)
         float buffer[block] {};
         float left[block] {}, right[block] {};
         float knob_pad_l[block] {}, knob_pad_r[block] {}; // a kit's pads under Knob FX, as the sampler left them (knob_pad_fed)
@@ -646,6 +657,7 @@ private:
     double ticks_frames(uint32_t from, uint32_t to) const;
     // Motion's points on ticks [from, to) of the pattern as played; `top` the pass's first tick (lanes start again).
     void play_motion(unsigned track, Slot& slot, const Pattern& pattern, uint32_t from, uint32_t to, bool top);
+    void reseed_ramps(unsigned track, Slot& slot, const Pattern& pattern, uint32_t at); // after ramps_stale
     // Elektron's per track direction (model/step_order.h): what tick `at` of a loop plays, the loop's steps from
     // `base` (written ticks) up to `end` (as played), on pass `pass`; `lane` a kit lane's key + 1 (0 the pattern).
     DirectedTick directed(unsigned track, const Pattern& pattern, uint32_t at, uint32_t end, uint32_t base, uint32_t pass, unsigned lane = 0) const;

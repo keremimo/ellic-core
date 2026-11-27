@@ -638,6 +638,200 @@ void motion() {
         return energy;
     };
     CHECK(level(true) * 20 < level(false));
+
+    // Ramps (points set by hand on Motion): a straight line to the lane's next point before the pattern's end, locks
+    // aside; the last holds. Moved and taken out by hand, kept by files.
+    Pattern r;
+    r.length = 16 * sixteenth_ticks;
+    auto ramp = [](unsigned sixteenth, unsigned param, int value) { auto m = point(sixteenth, param, value); m.ramp = true; return m; };
+    CHECK(r.write_motion(ramp(0, a, 0)) && r.write_motion(point(2, a, 50, 0, 6)) && r.write_motion(ramp(4, a, 100)));
+    CHECK(r.write_motion(point(2, b, 7)) && r.write_motion(ramp(8, a, 20)));
+    CHECK(r.ramp_end(0) == 3 && r.ramp_end(3) == 4 && r.ramp_end(4) == r.motion.size() && r.ramp_end(1) == r.motion.size() && r.ramp_end(2) == r.motion.size());
+    CHECK(r.lane_value(0, a, 0, -1) == 0 && r.lane_value(2 * sixteenth_ticks, a, 0, -1) == 50 && r.lane_value(4 * sixteenth_ticks, a, 0, -1) == 100);
+    CHECK(r.lane_value(sixteenth_ticks, a, 0, -1) == 25 && r.lane_value(6 * sixteenth_ticks, a, 0, -1) == 60);
+    CHECK(r.lane_value(15 * sixteenth_ticks, a, 0, -1) == 20 && r.lane_value(5, b, 0, -1) == -1);
+    CHECK(Pattern::ramp_value(ramp(0, a, 0), point(1, a, 3), 1) == 0 && Pattern::ramp_value(ramp(0, a, 10), point(1, a, 0), sixteenth_ticks / 2) == 5);
+    CHECK(!r.move_point(4 * sixteenth_ticks, 2 * sixteenth_ticks, a, 0) && !r.move_point(4 * sixteenth_ticks, r.length + 1, a, 0));
+    CHECK(r.move_point(4 * sixteenth_ticks, 12 * sixteenth_ticks, a, 0) && r.point_at(12 * sixteenth_ticks, a, 0)->ramp);
+    CHECK(!r.point_at(4 * sixteenth_ticks, a, 0) && r.lane_value(4 * sixteenth_ticks, a, 0, -1) == 10); // 0 to 20 over 8 sixteenths
+    CHECK(!r.erase_point(2 * sixteenth_ticks, a, 0) && r.erase_point(8 * sixteenth_ticks, a, 0)); // not the lock
+    CHECK(r.lane_value(6 * sixteenth_ticks, a, 0, -1) == 50 && r.lane_value(15 * sixteenth_ticks, a, 0, -1) == 100);
+    r.write_motion(point(14, a, 1)); // a recorded point holds; a ramp into one goes there
+    CHECK(r.ramp_end(r.motion_lower(14 * sixteenth_ticks)) == r.motion.size() && r.lane_value(13 * sixteenth_ticks, a, 0, -1) == 50);
+    { // Planned for the audio thread (played_pattern()): each point's ramp end and the lanes set from the start, as
+      // worked out afresh; how many lanes ramp at once (an edit keeps it under motion_ramps_at_once)
+        auto planned = played_pattern(r, speed_normal);
+        CHECK(planned.ramp_plan.planned && !r.ramp_plan.planned && planned == r); // the plan is not part of the pattern
+        for (size_t n = 0; n < planned.motion.size(); ++n) CHECK(planned.planned_ramp_end(n) == r.ramp_end(n));
+        CHECK(planned.ramp_plan.leads.empty()); // its first point is on tick 0
+        Pattern none;
+        none.write_motion(point(3, a, 5));
+        none.plan_ramps();
+        CHECK(none.ramp_plan.planned && none.ramp_plan.ends.empty() && none.planned_ramp_end(0) == none.motion.size());
+        Pattern wide;
+        wide.length = 16 * sixteenth_ticks;
+        for (unsigned k = 0; k < 20; ++k) { // twenty lanes in a line over the same bars: more than the engine once kept
+            CHECK(wide.write_motion(ramp(2, k, 0)) && wide.write_motion(ramp(10, k, 100)));
+        }
+        CHECK(wide.write_motion(ramp(12, 30, 0)) && wide.write_motion(point(14, 30, 9))); // after the others end
+        CHECK(wide.ramps_at_once() == 20 && motion_ramps_at_once >= 20);
+        auto wide_ends = wide.ramp_ends();
+        for (size_t n = 0; n < wide.motion.size(); ++n) CHECK(wide_ends[n] == wide.ramp_end(n));
+        wide.plan_ramps();
+        CHECK(wide.ramp_plan.leads.size() == 21 && wide.planned_ramp_end(0) == wide.motion_lower(10 * sixteenth_ticks));
+    }
+    { // a planned copy: lane_value() reads the plan and says what the pattern says; any edit drops the plan
+        auto planned = played_pattern(r, speed_normal);
+        CHECK(planned.ramps_planned());
+        for (uint32_t tick = 0; tick <= r.length; tick += 7) CHECK(planned.lane_value(tick, a, 0, -1) == r.lane_value(tick, a, 0, -1));
+        Pattern edited = planned;
+        CHECK(edited.write_motion(ramp(13, a, 3)) && !edited.ramps_planned());
+        Pattern pushed = planned;
+        pushed.motion.push_back(ramp(15, b, 3)); // past the Pattern's own calls: the plan no longer counts its points
+        CHECK(!pushed.ramps_planned());
+        Pattern erased = planned;
+        CHECK(erased.erase_point(0, a, 0) && !erased.ramps_planned());
+        CHECK(Pattern::ramp_value(0, 10, 24, 0, 12) == 5 && Pattern::ramp_value(ramp(0, a, 10), point(1, a, 0), sixteenth_ticks / 2) == 5);
+    }
+    { // every point's ramp end in one pass, as ramp_end() works it out point by point
+        auto same = [](const Pattern& p) {
+            auto ends = p.ramp_ends();
+            if (ends.size() != p.motion.size()) return false;
+            for (size_t n = 0; n < ends.size(); ++n) if (ends[n] != p.ramp_end(n)) return false;
+            return true;
+        };
+        Pattern beyond = r; // a point past the end: no ramp goes there
+        beyond.write_motion(ramp(17, a, 99)); beyond.write_motion(ramp(20, b, 1));
+        CHECK(same(r) && same(beyond) && same(Pattern {}));
+    }
+    Pattern lead; // before the first point: its value when set by hand, else the track's own
+    lead.length = 16 * sixteenth_ticks;
+    CHECK(lead.write_motion(point(4, a, 40)) && lead.lane_value(0, a, 0, -1) == -1 && lead.first_point(a, 0)->value == 40);
+    CHECK(lead.write_motion(ramp(4, a, 40)) && lead.lane_value(0, a, 0, -1) == 40 && lead.lane_value(3 * sixteenth_ticks, a, 0, -1) == 40);
+    CHECK(lead.write_motion(point(2, a, 9, 0, 6)) && lead.lane_value(0, a, 0, -1) == 40 && !lead.first_point(b, 0));
+    Pattern end; // a point on the end itself: the line goes there as the pattern comes round; it is never played
+    end.length = 16 * sixteenth_ticks;
+    CHECK(end.write_motion(ramp(8, a, 0)) && end.write_motion(ramp(16, a, 80)));
+    CHECK(end.ramp_end(0) == 1 && end.lane_value(12 * sixteenth_ticks, a, 0, -1) == 40 && end.lane_value(15 * sixteenth_ticks, a, 0, -1) == 70);
+    CHECK(end.move_point(16 * sixteenth_ticks, 12 * sixteenth_ticks, a, 0) && end.move_point(12 * sixteenth_ticks, end.length, a, 0));
+    CHECK(!end.move_point(end.length, end.length + 1, a, 0));
+    { // A recorded point on the end (a knob turned across the bar line, a pattern shortened after recording) stays
+      // hidden past it, as before ramps: no line ends there, doubling and double speed do not bring it in, and a
+      // recorded point is not moved onto the end. Only a ramp sits on the end.
+        Pattern hidden;
+        hidden.length = 16 * sixteenth_ticks;
+        CHECK(hidden.write_motion(ramp(8, a, 0)) && hidden.write_motion(point(16, a, 80)));
+        CHECK(!hidden.motion[1].within(hidden.length) && hidden.ramp_end(0) == hidden.motion.size());
+        CHECK(hidden.ramp_ends()[0] == hidden.motion.size() && hidden.lane_value(15 * sixteenth_ticks, a, 0, -1) == 0);
+        CHECK(!hidden.move_point(8 * sixteenth_ticks, hidden.length, a, 0) || hidden.point_at(hidden.length, a, 0)->ramp);
+        Pattern held = hidden; // a recorded point before it: it does not move onto the end
+        CHECK(held.write_motion(point(4, a, 9)) && !held.move_point(4 * sixteenth_ticks, held.length, a, 0));
+        for (bool copy : {false, true}) {
+            Pattern twice = hidden;
+            CHECK(double_pattern(twice, 128 * 384, copy) && !twice.point_at(16 * sixteenth_ticks, a, 0) && !twice.point_at(32 * sixteenth_ticks, a, 0));
+        }
+        Pattern faster = hidden;
+        scale_pattern(faster, false); // double speed: the ramp to a quarter of the way, nothing in the middle
+        CHECK(faster.point_at(4 * sixteenth_ticks, a, 0) && !faster.point_at(8 * sixteenth_ticks, a, 0) && faster.motion.size() == 1);
+        auto quick = speed_pattern(hidden, 3);
+        CHECK(quick.motion.size() == 1 && !quick.point_at(quick.length, a, 0));
+    }
+    {
+        Pattern only; // the end point alone: set by hand, the lane holds it from the start
+        only.length = end.length;
+        CHECK(only.write_motion(ramp(16, a, 33)) && only.lane_value(0, a, 0, -1) == 33);
+        Pattern locked = end; // a lock on tick 0 is copied to the old end: doubling leaves it there (the end point gives way)
+        CHECK(locked.write_motion(point(0, a, 7, 0, 6)));
+        CHECK(double_pattern(locked, 128 * 384) && locked.lock_at(16 * sixteenth_ticks, a, 0) && !locked.point_at(16 * sixteenth_ticks, a, 0));
+        CHECK(locked.lock_at(16 * sixteenth_ticks, a, 0)->value == 7 && locked.point_at(32 * sixteenth_ticks, a, 0));
+        auto twice = end; // doubled with a copy: the first half still reaches it, and so does the new end
+        CHECK(double_pattern(twice, 128 * 384) && twice.point_at(16 * sixteenth_ticks, a, 0) && twice.point_at(32 * sixteenth_ticks, a, 0));
+        CHECK(twice.lane_value(15 * sixteenth_ticks, a, 0, -1) == 70 && twice.lane_value(31 * sixteenth_ticks, a, 0, -1) == 70);
+        auto quick = speed_pattern(end, 3); // another speed: the end stays the end
+        CHECK(quick.point_at(quick.length, a, 0) && quick.point_at(quick.length, a, 0)->value == 80);
+        auto faster = end;
+        scale_pattern(faster, false); // double speed: the end comes in to the middle
+        CHECK(faster.point_at(8 * sixteenth_ticks, a, 0) && faster.point_at(4 * sixteenth_ticks, a, 0));
+    }
+    {
+        auto project = std::make_unique<Project>();
+        auto bank = std::make_unique<PatternBank>();
+        bank->at[2][5] = r;
+        auto& mixed = bank->at[2][6]; // a mixer strip's lane (MOTS) among the others (MOTK): the ramps stay on their points
+        mixed.length = r.length;
+        CHECK(mixed.write_motion(ramp(1, a, 10)) && mixed.write_motion(ramp(2, motion_strip_base, 20)) && mixed.write_motion(point(3, a, 30)));
+        CHECK(mixed.write_motion(ramp(4, motion_strip_base, 40)) && mixed.write_motion(ramp(5, a, 50)) && mixed.write_motion(point(6, motion_strip_base, 60)));
+        auto copy = std::make_unique<Project>();
+        auto copy_bank = std::make_unique<PatternBank>();
+        CHECK(load_project(save_project(*project, *bank), *copy, *copy_bank).empty());
+        CHECK(copy_bank->at[2][5].motion == r.motion && copy_bank->at[2][6].motion == mixed.motion);
+    }
+
+    // Played: a ramp from silence up to full makes more sound than the same points holding, less than none at all.
+    auto ramped = [](int how) { // 0: no motion; 1: points that hold; 2: the first a ramp
+        auto project = std::make_unique<Project>();
+        auto bank = std::make_unique<PatternBank>();
+        tone_kit(*project, 0);
+        for (unsigned s = 0; s < 16; ++s) put(bank->at[0][0], s, uint8_t(sampler_first_note), 100);
+        if (how) {
+            auto first = point(0, sampler::Level, 0);
+            first.ramp = how == 2;
+            bank->at[0][0].write_motion(first);
+            bank->at[0][0].write_motion(point(4, sampler::Level, 127));
+        }
+        EngineHost host;
+        host.load(*project, *bank);
+        auto tone = tone_sample();
+        CHECK(host.offer_sample(0, &tone));
+        host.send({Command::Type::Play});
+        std::vector<int32_t> out(256);
+        double energy = 0;
+        for (unsigned n = 0; n < 160; ++n) { // to about step 3, inside the ramp
+            host.render(out.data(), 128, 1);
+            for (auto v : out) energy += double(v / 2147483648.0f) * (v / 2147483648.0f);
+        }
+        return energy;
+    };
+    double none = ramped(0), held = ramped(1), line = ramped(2);
+    CHECK(held * 4 < line && line < none);
+
+    { // A pattern changed part-way (a song clip changed while it plays, entered at its second bar): the last pattern's
+      // ramp stops moving the lane, which goes where the new pattern has it (here the track's own value).
+        auto project = std::make_unique<Project>();
+        auto bank = std::make_unique<PatternBank>();
+        load_sound(project->tracks[0], EngineKind::Midi, 0);
+        auto& t = project->tracks[0];
+        t.params[midi_track::Port] = midi_track::UsbC; t.params[midi_track::Channel] = 1;
+        t.params[midi_track::CcNumber1] = 74; t.params[midi_track::Cc1] = 7;
+        const uint32_t bar = project->bar_ticks();
+        auto& lined = bank->at[0][0];
+        lined.length = 2 * bar;
+        MotionPoint from; from.param = uint8_t(midi_track::Cc1); from.value = 0; from.ramp = true;
+        MotionPoint to = from; to.tick = lined.length; to.value = 120; // a line over both bars, to a point on the end
+        CHECK(lined.write_motion(from) && lined.write_motion(to));
+        bank->at[0][1].length = 2 * bar; // no motion
+        project->song.place({0, 0, 0, 2, false});
+        EngineHost host;
+        host.load(*project, *bank);
+        host.set_audio_format(44100, 384);
+        host.send({Command::Type::Play, 0, 0, 0, 1}); // the song
+        std::vector<int32_t> out(256);
+        std::vector<int> before, after;
+        auto run = [&](unsigned blocks, std::vector<int>& into) {
+            for (unsigned b = 0; b < blocks; ++b) {
+                host.render(out.data(), 128, 1);
+                MidiOutEvent e;
+                while (host.take_midi(e)) if (e.kind == MidiOutEvent::Kind::Control && e.a == 74) into.push_back(e.b);
+            }
+        };
+        run(600, before); // most of bar 1 (88200 frames a bar at 120 BPM): the line climbing
+        CHECK(before.size() > 10 && before.back() > 20 && before.back() < 60);
+        host.send([] { Command c {Command::Type::SongClip}; c.index = 0; c.clip = {0, 1, 0, 2, false}; return c; }());
+        run(250, after); // into bar 2: pattern 1 from its second bar
+        auto seven = std::find(after.begin(), after.end(), 7);
+        CHECK(seven != after.end()); // back to the track's own value
+        for (auto v = seven; v != after.end(); ++v) CHECK(*v == 7); // and no line moving it after
+    }
 }
 // Freeze plan F3: an audio track's take lives in its pattern (a pattern with one is not empty) and goes through a
 // file with the track's settings; a take on a track that is not an audio track is dropped.

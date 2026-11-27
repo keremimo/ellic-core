@@ -432,7 +432,7 @@ void EngineHost::load_track(unsigned t, const Track& track) {
     slot.out_was = slot.out; // loaded: no crossing over
     for (unsigned b = 0; b < bus_count; ++b) { slot.sends[b] = track.mix.sends[b] / 100.0f; slot.mix_sends[b] = track.mix.sends[b]; }
     slot.mute = track.mix.mute; slot.solo = track.mix.solo;
-    slot.pattern = track.pattern;
+    slot.set_pattern(track.pattern);
     slot.off = track.off; slot.off_queued = false; // sequence links: silent from the next Play
     patterns_now[t].store(slot.pattern, std::memory_order_relaxed);
     for (unsigned k = 0; k < max_slots; ++k) {
@@ -1017,6 +1017,7 @@ void EngineHost::apply(const Command& c) {
             bool program = old && slot.kind == EngineKind::Midi && slot.pattern == c.pattern % pattern_count && old->program != c.data->program;
             retire(old);
             if (running && slot.pattern == c.pattern % pattern_count) fit_kept(c.track % track_count); // pad-fx C: its punches as it holds them now
+            if (slot.pattern == c.pattern % pattern_count) slot.ramps_stale = true; // its lines as the new copy draws them, next tick
             if (replan) plan_follow(c.track % track_count);
             if (program) midi_program(c.track % track_count, frame_now, false); // its own program turned: sent now
         }
@@ -1031,7 +1032,7 @@ void EngineHost::apply(const Command& c) {
         }
         slot.off_queued = false;
         if (running && !song_mode) slot.queued = uint8_t(c.value % pattern_count);
-        else if (!song_mode) { slot.pattern = uint8_t(c.value % pattern_count); slot.queued = 255; slot.off = false; lead = slot.pattern; follow_tempo(); }
+        else if (!song_mode) { slot.set_pattern(uint8_t(c.value % pattern_count)); slot.queued = 255; slot.off = false; lead = slot.pattern; follow_tempo(); }
         patterns_now[c.track % track_count].store(slot.pattern, std::memory_order_relaxed);
         if (!running && slot.kind == EngineKind::Midi) midi_program(c.track % track_count, frame_now, false); // roadmap P4: its own program
         break;
@@ -1047,8 +1048,8 @@ void EngineHost::apply(const Command& c) {
         unsigned t = c.track % track_count;
         if (!running || song_mode || slot.pattern != c.pattern % pattern_count || slot.silent) break;
         const auto& other = slots[c.index % track_count];
-        if (c.index < track_count && c.index != t && !other.silent) slot.start = other.start; // the track it fits: from its top
-        else slot.start = tick_now - (tick_now - slot.start) % std::max<uint32_t>(patterns[t][slot.pattern]->length, 1);
+        if (c.index < track_count && c.index != t && !other.silent) slot.set_start(other.start); // the track it fits: from its top
+        else slot.set_start(tick_now - (tick_now - slot.start) % std::max<uint32_t>(patterns[t][slot.pattern]->length, 1));
         fit_kept(t);    // pad-fx C: its punches as it counts now
         plan_follow(t); // roadmap P5: counted from its top again
         break;
@@ -1096,8 +1097,8 @@ void EngineHost::apply(const Command& c) {
         loop_restart = true;
         for (auto& s : slots) {
             if (s.off_queued) { s.off = true; s.off_queued = false; }
-            if (s.queued != 255) { s.pattern = s.queued; s.queued = 255; s.off = false; } // a launch ends off
-            s.start = 0; s.clip = -1; s.silent = song_mode || s.off; // off (sequence links): until a launch
+            if (s.queued != 255) { s.set_pattern(s.queued); s.queued = 255; s.off = false; } // a launch ends off
+            s.set_start(0); s.clip = -1; s.silent = song_mode || s.off; // off (sequence links): until a launch
         }
         in_song.store(song_mode, std::memory_order_relaxed);
         {
@@ -1135,7 +1136,7 @@ void EngineHost::apply(const Command& c) {
         for (unsigned t = 0; t < track_count; ++t) {
             positions_now[t].store(-1, std::memory_order_relaxed);
             for (auto& skip : slots[t].skips) skip.key = -1;
-            if (slots[t].queued != 255) { slots[t].pattern = slots[t].queued; slots[t].queued = 255; slots[t].off = false; } // a launch ends off
+            if (slots[t].queued != 255) { slots[t].set_pattern(slots[t].queued); slots[t].queued = 255; slots[t].off = false; } // a launch ends off
             if (slots[t].off_queued) { slots[t].off = true; slots[t].off_queued = false; } // off waiting for its bar
             slots[t].silent = false; slots[t].clip = -1;
             slots[t].follow_do = 0; // roadmap P5
@@ -1172,7 +1173,7 @@ void EngineHost::apply(const Command& c) {
         restart_ahead();
         arp_ticks = 0; until_arp = 0; arp_origin = tick_now; // the repeats from it
         loop_restart = true;
-        for (auto& s : slots) { s.start = 0; for (auto& skip : s.skips) skip.key = -1; }
+        for (auto& s : slots) { s.set_start(0); for (auto& skip : s.skips) skip.key = -1; }
         for (unsigned t = 0; t < track_count; ++t) fit_kept(t);    // pad-fx C: a kept punch the new place is not in lets go
         for (unsigned t = 0; t < track_count; ++t) plan_follow(t); // roadmap P5: counted from the patterns' top again
         tick_count.store(tick_now, std::memory_order_relaxed);
@@ -1867,6 +1868,8 @@ void EngineHost::restore(Slot& slot) {
     }
     for (auto& l : slot.locks) l.param = -1; // locks end with everything they moved
     slot.locks_on = 0;
+    for (auto& r : slot.ramps) r.param = -1; // and ramps
+    slot.ramps_on = 0;
     if (mods_on) mod_back(unsigned(&slot - slots.data())); // roadmap P4: modulators swing around the values as set again
     if (slot.strip_moved) { // the mixer's strip back as set (it glides there)
         strips[unsigned(&slot - slots.data())].set(strip_set_by[unsigned(&slot - slots.data())]);
@@ -1894,10 +1897,38 @@ void EngineHost::restore(Slot& slot) {
 // Motion at tick `at` of the track's pattern (roadmap P1: the pattern's own, at
 // tick resolution): each lane starts the pattern at the track's own value,
 // then follows its points; a lock holds for its ticks, then its lane goes
-// back to what it holds as recorded there (else the track's own value).
+// back to what it holds as recorded there (else the track's own value). A
+// ramp moves its lane a little each tick on its way to the lane's next point
+// (not while a lock holds the lane). Played from anywhere but the tick after
+// the last (a Locate, an edit loop, a track playing its steps in another
+// order), the ramps are worked out afresh where it lands.
 void EngineHost::play_motion(unsigned t, Slot& slot, const Pattern& pattern, uint32_t from, uint32_t to, bool top) {
     const uint32_t at = from; // a tick of a directed track plays [from, to) of its pattern (directed())
-    if (top) restore(slot);
+    if (top) {
+        restore(slot);
+        // A lane whose first point was set by hand holds its value from the start, as planned beforehand (played_pattern()).
+        // A pattern not planned (or edited since) plays no ramps: its points hold, as in builds before ramps.
+        if (pattern.ramps_planned())
+            for (uint32_t n : pattern.ramp_plan.leads)
+                if (n < pattern.motion.size()) move_lane(t, slot, pattern.motion[n].param, pattern.motion[n].pad, pattern.motion[n].value);
+    }
+    if (!top && at != slot.motion_at + 1) slot.ramps_stale = true; // a jump: the ramps where it lands
+    slot.motion_at = at;
+    if (slot.ramps_stale) reseed_ramps(t, slot, pattern, at);
+    unsigned ramps_left = slot.ramps_on; // the ramps playing, no further than the last of them
+    for (size_t k = 0; k < slot.ramps.size() && ramps_left; ++k) {
+        auto& r = slot.ramps[k];
+        if (r.param < 0) continue;
+        --ramps_left;
+        if (at <= r.from || at > r.to) { r.param = -1; --slot.ramps_on; continue; } // left (on its end tick its point ends it)
+        int value = Pattern::ramp_value(r.from, r.a, r.to, r.b, at);
+        if (value == r.last) continue;
+        bool locked = false;
+        for (const auto& l : slot.locks) locked |= l.param == r.param && l.pad == r.pad;
+        if (locked) continue;
+        r.last = value;
+        move_lane(t, slot, unsigned(r.param), r.pad, value);
+    }
     if (slot.locks_on)
         for (auto& l : slot.locks) {
             if (l.param < 0 || --l.left > 0) continue;
@@ -1907,17 +1938,67 @@ void EngineHost::play_motion(unsigned t, Slot& slot, const Pattern& pattern, uin
             int value = pattern.lane_value(at, param, pad, none);
             if (value == none) restore_lane(t, slot, param, pad);
             else move_lane(t, slot, param, pad, value);
+            for (auto& r : slot.ramps) // a ramp under the lock goes on from there (not sending that value again)
+                if (r.param == int(param) && r.pad == pad) r.last = value;
         }
     for (size_t n = pattern.motion_lower(from); n < pattern.motion.size() && pattern.motion[n].tick < to; ++n) {
         const auto& m = pattern.motion[n];
-        move_lane(t, slot, m.param, m.pad, m.value);
-        if (!m.lock()) continue;
+        bool reached = false; // a ramp on its lane got to its value already (a value spans several ticks): not sent again
+        if (!m.lock() && slot.ramps_on) // a point ends any ramp on its lane
+            for (auto& r : slot.ramps)
+                if (r.param == m.param && r.pad == m.pad) { reached = r.last == m.value; r.param = -1; --slot.ramps_on; }
+        if (!reached) move_lane(t, slot, m.param, m.pad, m.value);
+        if (!m.lock()) {
+            if (!m.ramp || !pattern.ramps_planned()) continue; // a ramp starts another, as planned (played_pattern())
+            size_t to = pattern.planned_ramp_end(n);
+            if (to >= pattern.motion.size()) continue;
+            for (auto& r : slot.ramps)
+                if (r.param < 0) { r = {int16_t(m.param), m.pad, m.tick, pattern.motion[to].tick, m.value, pattern.motion[to].value, m.value}; ++slot.ramps_on; break; }
+            continue;
+        }
         bool again = false; // a lock already on this lane starts over; else a free one
         for (auto& l : slot.locks)
             if (l.param == m.param && l.pad == m.pad) { l.left = m.hold; again = true; }
         if (again) continue;
         for (auto& l : slot.locks)
             if (l.param < 0) { l = {int16_t(m.param), m.pad, m.hold}; ++slot.locks_on; break; }
+    }
+}
+
+// The pattern playing came again (an edit) while its ramps ran: the ramps the new copy has running at `at` take
+// over (from where their lines are now), and a lane whose ramp is gone goes where the new copy has it (as a lock's
+// end does). Once per copy, bounded by its points; nothing allocated.
+void EngineHost::reseed_ramps(unsigned t, Slot& slot, const Pattern& pattern, uint32_t at) {
+    slot.ramps_stale = false;
+    const bool ramps = pattern.ramps_planned() && !pattern.ramp_plan.ends.empty(); // the new copy has ramps at all
+    if (!ramps && !slot.ramps_on) return; // none ran and none run: nothing to work out (most patterns, every edit)
+    std::array<Slot::Ramp, motion_ramps_at_once> was = slot.ramps;
+    for (auto& r : slot.ramps) r.param = -1;
+    slot.ramps_on = 0;
+    for (size_t n = 0; ramps && n < pattern.motion.size() && pattern.motion[n].tick < at; ++n) { // ramps begun before `at`
+        const auto& m = pattern.motion[n];
+        if (!m.ramp || m.lock()) continue;
+        size_t to = pattern.planned_ramp_end(n);
+        if (to >= pattern.motion.size() || pattern.motion[to].tick <= at) continue; // over by now (one per lane holds `at`)
+        Slot::Ramp next {int16_t(m.param), m.pad, m.tick, pattern.motion[to].tick, m.value, pattern.motion[to].value, INT32_MIN};
+        for (const auto& old : was) // the same line as before: where it got to stands (nothing sent again)
+            if (old.param == next.param && old.pad == next.pad && old.from == next.from && old.to == next.to && old.a == next.a && old.b == next.b)
+                next.last = old.last;
+        for (auto& r : slot.ramps)
+            if (r.param < 0) { r = next; ++slot.ramps_on; break; }
+    }
+    for (const auto& old : was) { // a lane that was ramping and is no more: where the new copy has it
+        if (old.param < 0) continue;
+        bool still = false;
+        for (const auto& r : slot.ramps) still |= r.param == old.param && r.pad == old.pad;
+        if (still) continue;
+        bool locked = false;
+        for (const auto& l : slot.locks) locked |= l.param == old.param && l.pad == old.pad;
+        if (locked) continue; // the lock's end puts it right
+        constexpr int none = INT32_MIN;
+        int value = pattern.lane_value(at, unsigned(old.param), old.pad, none);
+        if (value == none) restore_lane(t, slot, unsigned(old.param), old.pad);
+        else move_lane(t, slot, unsigned(old.param), old.pad, value);
     }
 }
 
@@ -2073,7 +2154,7 @@ void EngineHost::bar_start() {
             // A MIDI track that read this launch ahead (play_ahead()) sent these already, ahead of the notes it sent.
             const bool sent = slot.kind == EngineKind::Midi && slot.ahead_bar == tick_now && slot.ahead_queued == slot.queued;
             if (slot.kind == EngineKind::Midi && slot.queued != slot.pattern && !sent) midi_all_off(t, early_frame(t)); // the old pattern's notes end
-            slot.pattern = slot.queued; slot.queued = 255; slot.start = tick_now;
+            slot.set_pattern(slot.queued, tick_now); slot.queued = 255;
             drop_kept(t); // pad-fx C: the old pattern's punches end here
             if (slot.kind == EngineKind::Midi && !sent) midi_program(t, early_frame(t), false); // roadmap P4: a pattern's own program, ahead of its notes
             patterns_now[t].store(slot.pattern, std::memory_order_relaxed);
@@ -2142,7 +2223,7 @@ void EngineHost::follow(unsigned t) {
     follows_now[t].store(follows_now[t].load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     if (to < 0) { stop_track(t); return; } // STOP
     if (slot.kind == EngineKind::Midi && unsigned(to) != slot.pattern) midi_all_off(t, early_frame(t)); // as a launch
-    slot.pattern = uint8_t(to); slot.start = tick_now;
+    slot.set_pattern(uint8_t(to), tick_now);
     drop_kept(t); // pad-fx C: the old pattern's punches end here
     if (slot.kind == EngineKind::Midi) midi_program(t, early_frame(t), false);
     patterns_now[t].store(slot.pattern, std::memory_order_relaxed);
@@ -2166,10 +2247,10 @@ void EngineHost::clips_at_bar(bool force) {
             // A clip starts, the loop came back (to its first bar, or inside it), or the clip was changed while it
             // played: its pattern from where the clip says.
             slot.clip = index;
-            slot.pattern = clip.pattern;
+            slot.set_pattern(clip.pattern);
             drop_kept(t); // pad-fx C: the clip before's punches end here
             if (slot.kind == EngineKind::Midi) midi_program(t, early_frame(t), false); // roadmap P4
-            slot.start = start;
+            slot.set_start(start);
             patterns_now[t].store(slot.pattern, std::memory_order_relaxed);
         }
     }
@@ -2211,7 +2292,7 @@ void EngineHost::mtc_place(double seconds) {
         }
     } else {
         tick_now = at;
-        for (auto& s : slots) s.start = 0;
+        for (auto& s : slots) s.set_start(0);
         for (unsigned t = 0; t < track_count; ++t) fit_kept(t); // pad-fx C: as Locate
     }
     tick_count.store(tick_now, std::memory_order_relaxed);
@@ -3018,7 +3099,8 @@ void EngineHost::play_tick_notes(unsigned t, Slot& slot, uint32_t at_tick, unsig
     if (edit_loop(t, length, from, span)) { at = from + elapsed % span; pass = elapsed / span; end = from + span; base = slot.loop_from; } // its bars over and over
     // The ticks this one plays: itself, or with a direction (model/step_order.h) its place in the step the order puts here.
     const DirectedTick here = directed(t, pattern, at, end, base, pass);
-    if (slot.engine && (at == 0 || !pattern.motion.empty() || slot.locks_on)) play_motion(t, slot, pattern, here.from, here.to, at == 0);
+    if (slot.engine && (at == 0 || !pattern.motion.empty() || slot.locks_on || slot.ramps_on || slot.ramps_stale))
+        play_motion(t, slot, pattern, here.from, here.to, at == 0);
     const auto& events = pattern.events;
     Slot::Held holding; // this tick's own Slide or Tie, for the notes of a later one
     bool lanes = !pattern.lanes.empty();
