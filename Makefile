@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026 Kerem Kilic (Ellic Studio)
 # The core's own tests (tests/core_tests.cpp) against the core's sources that
 # need no JUCE, on Linux: `make test`, from tests/test_core.py or a product's
 # build (./build.sh in melodee-sample and melodee-move run it in their build

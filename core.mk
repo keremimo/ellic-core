@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026 Kerem Kilic (Ellic Studio)
 # ellic-core in a product's build: the product's Makefile sets CORE (where
 # this checkout is, by default the core/ submodule), includes this file and
 # compiles CORE_SOURCES with CORE_CPPFLAGS among its own flags. Nothing here

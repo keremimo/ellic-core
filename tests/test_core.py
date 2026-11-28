@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026 Kerem Kilic (Ellic Studio)
 """The core's own tests (tests/core_tests.cpp, `make test`), built on Linux."""
 from pathlib import Path
 import os
