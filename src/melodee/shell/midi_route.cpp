@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Kerem Kilic (Ellic Studio)
 #include "melodee/shell/midi_route.h"
 #include "melodee/model/sampler.h"
+#include "melodee/model/scales.h"
 #include <algorithm>
 #include <cmath>
 
@@ -70,7 +71,14 @@ int levels_key(const Track& track, int key, bool instrument, int root) {
     const unsigned kit = track.levels_pad % sampler_pads;
     const auto& pad = track.pads[kit];
     if (!pad.used()) return -1;
-    return pad_note(int(sampler_first_note + kit), key - 60 - (instrument ? int(pad.pitch) : root));
+    return pad_note(int(sampler_first_note + kit), levels_key_semitones(track, key, instrument, root));
+}
+
+int levels_key_semitones(const Track& track, int key, bool instrument, int root) {
+    // Issue 43: an instrument keeps its Semi on the keys, as its pads do under Scale, Tune and Chords; only Zones,
+    // whose pads play its keys themselves, undoes it.
+    const bool zones = instrument && LevelsKind(track.levels_kind % unsigned(LevelsKind::Count)) == LevelsKind::Zones;
+    return key - 60 - (zones ? int(track.pads[track.levels_pad % sampler_pads].pitch) : instrument ? 0 : root);
 }
 
 void ClockFollower::pulse(uint64_t ns) {

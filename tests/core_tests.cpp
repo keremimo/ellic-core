@@ -5753,7 +5753,16 @@ void note_pitches() {
     kit.levels = true;
     const int note = int(sampler_first_note) + 18;
     CHECK(levels_key(kit, 60, false) == note && levels_key(kit, 72, false) == pad_note(note, 12) && levels_key(kit, 20, false) == pad_note(note, -40));
+    // Issue 43: an instrument keeps the pad's Semi on the keys, as its pads under Scale, Tune and Chords: key 60 the
+    // pad as they play it (and no sample's note); only Zones, whose pads play its keys, plays it at real pitch.
+    for (auto kind : {LevelsKind::Scale, LevelsKind::Tune, LevelsKind::Velocity, LevelsKind::Filter, LevelsKind::Chords}) {
+        kit.levels_kind = uint8_t(kind);
+        CHECK(levels_key(kit, 60, true) == note && levels_key(kit, 63, true) == pad_note(note, 3) && levels_key(kit, 60, true, 5) == note);
+        CHECK(levels_key_semitones(kit, 48, true) == -12);
+    }
+    kit.levels_kind = uint8_t(LevelsKind::Zones);
     CHECK(levels_key(kit, 63, true) == note && levels_key(kit, 60, true) == pad_note(note, -3)); // an instrument at real pitch
+    CHECK(levels_key_semitones(kit, 63, true) == 0 && levels_key_semitones(kit, 60, false) == 0); // a single sample: Zones is Scale
     CHECK(levels_key(kit, 128, false) == -1);
     kit.arp = true;
     CHECK(levels_key(kit, 60, false) == -1);

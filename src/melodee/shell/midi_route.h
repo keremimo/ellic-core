@@ -46,11 +46,13 @@ RemoteJob remote_cc(const MidiConfig& config, unsigned channel, unsigned cc, uns
 // below the first pad; a 909 its drums from 36 as its pads.
 int note_key(const Track& track, int note, bool every_key = false); // every_key: a kit pad on the keys under 16 Levels
 
-// 16 Levels on a kit (no arp): the whole keyboard plays the 16 Levels pad, key 60 its root. An instrument plays at its
-// real pitch (the pad's Semi undone); a single sample is its note (`root`, levels_root_shift(): key 60 + root the pad
-// as its pads play it), a C when it has none. The pad note (pad_note()) for `key`, or -1 when the keyboard plays the
-// kit's pads.
+// 16 Levels on a kit (no arp): the whole keyboard plays the 16 Levels pad, key 60 the pad as its pads play it, its
+// Semi and Fine in it; a single sample is its note (`root`, levels_root_shift(): key 60 + root), a C when it has none.
+// Under Zones an instrument plays at its real pitch (the pad's Semi undone), as Zones' pads do. The pad note
+// (pad_note()) for `key`, or -1 when the keyboard plays the kit's pads.
 int levels_key(const Track& track, int key, bool instrument, int root = 0);
+// The semitones `key` moves that pad: levels_key()'s, and what Seq Record writes.
+int levels_key_semitones(const Track& track, int key, bool instrument, int root = 0);
 
 // The channel a track's notes go out on (its own, else MIDI Config's Out) and
 // when (PadMidiOut), for Command::MidiTrack.
