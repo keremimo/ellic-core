@@ -1460,9 +1460,22 @@ void EngineHost::engine_pressure(Slot& slot, int key, float value) {
     if (!keep_call(slot, call)) make_call(unsigned(&slot - slots.data()), slot, call);
 }
 
+// Freeze plan F2b: whether the track's engine hears the song stopped from frame `at` on (Slot::hears_stop). A block
+// played in one dispatch keeps the frames it changed on for play_calls(): two changes on a frame cancel, and past four
+// a block the last two do (the state between them is lost, never the one it ends in).
+void EngineHost::follow_stop(Slot& slot, unsigned at, bool whole) {
+    const bool stop = slot.freeze && !slot.shared && (slot.print_on || slot.silent || !running);
+    if (stop == slot.hears_stop) return;
+    slot.hears_stop = stop;
+    if (!whole) return;
+    if (slot.stop_count && slot.stop_frames[slot.stop_count - 1] == at) { --slot.stop_count; return; }
+    if (slot.stop_count == slot.stop_frames.size()) { --slot.stop_count; return; }
+    slot.stop_frames[slot.stop_count++] = uint16_t(at);
+}
+
 // The engine's frames [at, at + frames) into its buffers; a kit's pads that go apart (Sidechain's key pad, Knob FX)
 // into theirs at the same frames.
-void EngineHost::render_engine(unsigned t, Slot& slot, unsigned at, unsigned frames) {
+void EngineHost::render_engine(unsigned t, Slot& slot, unsigned at, unsigned frames, bool stopped) {
     if (slot.engine == &slot.sampler) {
         bool pad_key = keyed_pad == int(t);
         slot.sampler.set_key_pad(pad_key ? int(comp.key_pad()) : -1, pad_key ? key_pad_l + at : nullptr, pad_key ? key_pad_r + at : nullptr);
@@ -1471,8 +1484,14 @@ void EngineHost::render_engine(unsigned t, Slot& slot, unsigned at, unsigned fra
         slot.sampler.set_stem_out(pad_stem_ring ? pad_stem_ring->pad_rows(t) : nullptr, pad_stem_rows.get(), block, at);
         for (unsigned n = 0; n < sub_count; ++n) slot.sampler.set_sub_out(n, slot.pad_subs->l[n] + at, slot.pad_subs->r[n] + at);
     }
+    // Freeze plan F2b: while its print plays in its place, the engine hears the song stopped (held_clock, Slot::hears_stop).
+    // The host cuts none of its notes, and what it plays by itself stops, so the print is heard alone and it sleeps.
+    // A plug-in may end its own notes on Stop, and one played by hand meanwhile hears the song stopped too.
+    const EffectClock* heard = effect_clock_now;
+    if (stopped) effect_clock_now = &held_clock;
     if (slot.engine->stereo()) slot.engine->render_stereo(slot.left + at, slot.right + at, frames);
     else slot.engine->render(slot.buffer + at, frames);
+    effect_clock_now = heard;
     if (slot.engine == &slot.sampler) {
         slot.knob_pad_fed |= slot.sampler.knob_fed(); slot.send_pad_fed |= slot.sampler.sends_fed(); slot.sub_pad_fed |= slot.sampler.subs_fed();
     }
@@ -1486,14 +1505,18 @@ void EngineHost::play_calls(unsigned t, Slot& slot, unsigned frames) {
         slot.call_count = 0;
         return;
     }
+    bool stopped = slot.stop_from; // freeze plan F2b: as it was at the block's start, then on the frames it changed on
+    unsigned h = 0;
     while (at < frames) {
         while (k < count && slot.calls[k].frame <= at) make_call(t, slot, slot.calls[k++]);
+        while (h < slot.stop_count && slot.stop_frames[h] <= at) { stopped = !stopped; ++h; }
         unsigned to = k < count ? std::min<unsigned>(slot.calls[k].frame, frames) : frames;
+        if (h < slot.stop_count) to = std::min<unsigned>(to, slot.stop_frames[h]);
         if (split_cuts) { // tests: where the old way cut it too
             while (cut < cut_count && cuts[cut] <= at) ++cut;
             if (cut < cut_count) to = std::min<unsigned>(to, cuts[cut]);
         }
-        render_engine(t, slot, at, to - at);
+        render_engine(t, slot, at, to - at, stopped);
         at = to;
     }
     while (k < count) make_call(t, slot, slot.calls[k++]); // none: every call falls inside the block
@@ -3344,6 +3367,8 @@ void EngineHost::render(int32_t* out, unsigned frames, float volume, const int32
         double from = song_mode ? double(tick_now && !in_bar ? song_bar_now + 1 : song_bar_now) * bar_ticks + in_bar : double(tick_now);
         fx_clock->song = std::max(0.0, (from - std::max(until_tick, 0.0) / tick_length()) / ticks_per_quarter);
     }
+    held_clock = *fx_clock;
+    held_clock.playing = false;
     if (mods_on) run_modulators(frames); // roadmap P4: before the tracks' buffers are cleared (a follower hears the last block)
     bool solo = false;
     for (auto& strip : loop_strips) solo |= strip.solo && loops.on();
@@ -3395,6 +3420,17 @@ void EngineHost::render(int32_t* out, unsigned frames, float volume, const int32
     deferring = whole;
     keyed_pad = pad_keyed;
     cut_count = 0;
+    // Freeze plan F2b: where each engine's hearing of the song starts this block (Slot::hears_stop), and the frozen tracks
+    // whose plug-in another track plays too.
+    bool any_frozen = false;
+    for (auto& slot : slots) { slot.stop_from = slot.hears_stop; slot.stop_count = 0; slot.shared = false; any_frozen |= slot.freeze != nullptr; }
+    if (any_frozen)
+        for (unsigned a = 0; a < track_count; ++a) {
+            const PluginRunner* runner = slots[a].engine == &slots[a].plugin ? slots[a].plugin.attached() : nullptr;
+            if (!runner) continue;
+            for (unsigned b = a + 1; b < track_count; ++b)
+                if (slots[b].engine == &slots[b].plugin && slots[b].plugin.attached() == runner) slots[a].shared = slots[b].shared = true;
+        }
     block_frames = frames;
     unsigned done = 0;
     while (done < frames) {
@@ -3419,6 +3455,7 @@ void EngineHost::render(int32_t* out, unsigned frames, float volume, const int32
         // Ratchets' hits on their frames: the run ends where the next one is due.
         n = std::min(n, next_hit());
         block_at = done;
+        for (auto& slot : slots) follow_stop(slot, done, whole);
         for (unsigned t = 0; t < track_count; ++t) run_hits(t, slots[t], n);
         // Note-offs and late arp notes first, track by track (they may send MIDI out), then the engines, each
         // track's apart: on the render workers too when there is enough to share (render_pool.h).
@@ -3444,8 +3481,11 @@ void EngineHost::render(int32_t* out, unsigned frames, float volume, const int32
             auto& slot = slots[t];
             if (slot.freeze && !slot.awake) return; // freeze plan F2b: its print plays instead
             auto t0 = std::chrono::steady_clock::now();
+            const EffectClock* heard = effect_clock_now; // freeze plan F2b: as render_engine() has it
+            if (slot.hears_stop) effect_clock_now = &held_clock;
             if (slot.engine->stereo()) slot.engine->render_stereo(slot.left + done, slot.right + done, n);
             else slot.engine->render(slot.buffer + done, n);
+            effect_clock_now = heard;
             if (slot.engine == &slot.sampler) {
                 slot.knob_pad_fed |= slot.sampler.knob_fed(); slot.send_pad_fed |= slot.sampler.sends_fed(); slot.sub_pad_fed |= slot.sampler.subs_fed();
             }

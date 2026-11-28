@@ -94,6 +94,10 @@ void print_project(Project& project, PatternBank& bank, unsigned track, unsigned
 // print holds neither; playback takes the track's own. (Before, a track with effects kept its own here; such a print's
 // project hashes differently now, so it is printed again.)
 Mix print_mix(const Track& track);
+// Freeze: whether `track` is a PLUGIN track whose plug-in hears the transport (TRANSPORT on, PluginRef::transport).
+// Such a plug-in may play by itself with no note sent (a sequencer or an arpeggiator of its own), so a pattern of its
+// track without notes can be frozen too, once picked (the shell's Context::freezable()).
+bool hears_transport(const Project& project, unsigned track);
 
 // What made a print: a print_project() and the plug-ins' states (plugin/plugin_rack.h; only the entries it uses
 // count), with its tap, tail and the device's rate. 64-bit FNV-1a over the project file save_project() writes of them.

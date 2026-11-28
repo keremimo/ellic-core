@@ -25,6 +25,12 @@ void PrintTable::put(const PrintRecord& record) {
 
 Mix print_mix(const Track&) { return Mix {}; }
 
+bool hears_transport(const Project& project, unsigned track) {
+    const Track& tr = project.tracks[track % track_count];
+    return tr.engine == EngineKind::Plugin && tr.plugin < max_plugins && project.plugins[tr.plugin].used() &&
+           project.plugins[tr.plugin].transport;
+}
+
 void print_project(Project& project, PatternBank& bank, unsigned track, unsigned pattern) {
     const unsigned t = track % track_count, p = pattern % pattern_count;
     for (unsigned k = 0; k < track_count; ++k)

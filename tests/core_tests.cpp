@@ -8685,6 +8685,169 @@ void freeze_f2b() {
     std::puts("freeze ok");
 }
 
+// A plug-in that plays by itself while it hears the song play, as one with a sequencer or an arpeggiator of its own
+// does: a short bump on every sixteenth, placed by the song's place alone (it keeps nothing between renders), and
+// silent while it hears the song stopped. Its renders count what it heard.
+struct SequencerRunner final : PluginRunner {
+    uint64_t block_seen = ~uint64_t(0);
+    double into = 0; // device frames of this block rendered already: it is played in parts
+    unsigned heard_playing = 0, heard_stopped = 0;
+    struct Heard { uint64_t block; unsigned at, frames; bool playing; };
+    std::vector<Heard> renders;
+    void midi(uint8_t, uint8_t, uint8_t) override {}
+    void silence() override {}
+    void render(float* left, float* right, unsigned frames) override {
+        const EffectClock& c = *effect_clock_now;
+        if (c.block != block_seen) { block_seen = c.block; into = 0; }
+        ++(c.playing ? heard_playing : heard_stopped);
+        renders.push_back({c.block, unsigned(into), frames, c.playing});
+        if (c.playing) {
+            const double sixteenth = c.quarter / 4; // frames
+            for (unsigned f = 0; f < frames; ++f) {
+                const double q = c.song + (into + f) / c.quarter;
+                const double since = (q * 4 - std::floor(q * 4)) * sixteenth; // frames into this sixteenth
+                if (since >= 480) continue; // 11 ms, a smooth bump: moved a frame, it changes by 0.002 at most
+                const float shape = float(std::sin(3.14159265358979 * since / 480));
+                const float x = 0.25f * shape * shape;
+                left[f] += x; right[f] += x;
+            }
+        }
+        into += frames;
+    }
+};
+
+// Freeze, a plug-in that plays by itself: its print holds what it played, so while the print plays in its place the
+// plug-in hears the song stopped (as with TRANSPORT off). Heard once, not under its own print too, and its engine
+// sleeps. A launch to a pattern without a print, and Unfreeze, give it the song's Play again, where the song is, from
+// the frame the switch lands on. So does the older dispatch (a render a step). A frozen track that is stopped hears
+// the song stopped as well; a plug-in a live track plays too hears the song as that track does.
+void freeze_self_playing() {
+    const float rate = dsp::sample_rate();
+    auto project = std::make_unique<Project>();
+    auto bank = std::make_unique<PatternBank>(); // no notes anywhere: the plug-in's own sixteenths are the sound
+    synth(project->tracks[0], 0);
+    project->tempo = 1200; project->swing = 50;
+    const uint32_t ticks = played_pattern(bank->at[0][0], speed_normal).length;
+
+    auto pack = [&] { // A1's print as the print engine makes it, held whole; A2 has none
+        auto p = std::make_unique<Project>(*project);
+        auto b = std::make_unique<PatternBank>(*bank);
+        print_project(*p, *b, 0, 0);
+        auto printed = std::make_unique<SequencerRunner>(); // outlives the print host
+        auto host = std::make_unique<EngineHost>(EngineHost::Lean {2});
+        host->load(*p, *b);
+        CHECK(host->offer_plugin(0, printed.get()));
+        auto a = render_print(*host, 0, ticks, PrintTap::PostFx, PrintTail::Loop);
+        CHECK(a.error.empty() && printed->heard_playing > 0);
+        CHECK(peak_of(a.left) > 0.1f);
+        std::vector<float> frames(a.left.size() * 2);
+        for (size_t f = 0; f < a.left.size(); ++f) { frames[2 * f] = a.left[f]; frames[2 * f + 1] = a.right[f]; }
+        auto c = std::make_unique<PrintClip>();
+        c->hold_whole(std::move(frames), uint32_t(std::lround(rate)), uint32_t(a.pass), PrintTail::Loop);
+        auto* out = new FreezePack;
+        out->tap = PrintTap::PostFx;
+        out->owned.push_back(std::move(c));
+        out->clips[0] = out->owned.back().get();
+        return out;
+    };
+    // Track 1 as the Track source takes it, for three and a half passes; frozen on `frozen` from the start when one
+    // is given. `each` before every block.
+    struct Run { std::vector<float> l, r; std::unique_ptr<SequencerRunner> plugin; std::unique_ptr<EngineHost> host; };
+    const uint64_t pass = uint64_t(std::llround(ticks * 44100.0 * 60 / 120 / ticks_per_quarter * rate / 44100));
+    const unsigned blocks = unsigned((3 * pass + pass / 2) / 128);
+    auto run = [&](FreezePack* frozen, const std::function<void(EngineHost&, unsigned)>& each = {}, const Project* from = nullptr) {
+        Run out;
+        out.plugin = std::make_unique<SequencerRunner>();
+        out.host = std::make_unique<EngineHost>();
+        auto& host = *out.host;
+        host.load(from ? *from : *project, *bank);
+        CHECK(host.offer_plugin(0, out.plugin.get()));
+        host.send({Command::Type::RecordSource, uint8_t(InputSource::Track), 0, 0, 1});
+        if (frozen) { Command c {Command::Type::Freeze, 0}; c.freeze = frozen; CHECK(host.send(c)); }
+        host.send({Command::Type::Play});
+        std::vector<int32_t> o(256);
+        for (unsigned b = 0; b < blocks; ++b) {
+            if (each) each(host, b);
+            host.render(o.data(), 128, 1);
+            for (unsigned f = 0; f < 128; ++f) { out.l.push_back(host.print_left()[f]); out.r.push_back(host.print_right()[f]); }
+        }
+        return out;
+    };
+    // Within a hundredth: a print host tells the song's place between its ticks a hair apart from the live one, and
+    // a bump placed by it moves by a frame or so. Heard twice, they differ by a bump's whole height (0.25).
+    auto differ = [](const Run& a, const Run& b, size_t from = 0) {
+        uint64_t n = 0;
+        for (size_t f = from; f < a.l.size(); ++f) n += std::fabs(a.l[f] - b.l[f]) > 0.01f || std::fabs(a.r[f] - b.r[f]) > 0.01f;
+        return n;
+    };
+
+    auto live = run(nullptr);
+    CHECK(peak_of(live.l) > 0.1f && live.plugin->heard_stopped == 0);
+
+    {   // Frozen from the start: the print alone, the live sound; the plug-in hears the song stopped, so a second on
+        // its engine sleeps
+        std::vector<uint32_t> asleep(blocks);
+        auto frozen = run(pack(), [&](EngineHost& host, unsigned b) { if (b) asleep[b - 1] = host.sleeping_tracks() & 1; });
+        CHECK(differ(live, frozen) == 0);
+        CHECK(frozen.plugin->heard_playing == 0 && frozen.plugin->heard_stopped > 0);
+        CHECK(asleep[unsigned(pass / 128)] && asleep[blocks - 2]);
+        CHECK(frozen.host->print_underruns() == 0 && frozen.host->print_waits() == 0);
+    }
+    {   // A2 launched in the second pass: from its bar the print lets go and the plug-in plays A2 live, as it plays
+        // there unfrozen
+        const unsigned launch = unsigned(pass * 3 / 2 / 128), bar = unsigned(2 * pass / 128);
+        std::vector<uint32_t> asleep(blocks);
+        auto frozen = run(pack(), [&](EngineHost& host, unsigned b) {
+            if (b) asleep[b - 1] = host.sleeping_tracks() & 1;
+            if (b == launch) host.send({Command::Type::Pattern, 0, 0, 0, 1});
+        });
+        CHECK(frozen.host->pattern_of(0) == 1);
+        CHECK(differ(live, frozen) == 0);
+        CHECK(frozen.plugin->heard_playing > 0);
+        CHECK(asleep[launch - 1] && !asleep[bar + 1] && !asleep[blocks - 2]);
+        // Play from A2's first frame, inside a block: that block in two renders, stopped up to the bar, playing on
+        const auto& heard = frozen.plugin->renders;
+        auto first = std::find_if(heard.begin(), heard.end(), [](const SequencerRunner::Heard& h) { return h.playing; });
+        const unsigned seam = unsigned(2 * pass % 128);
+        CHECK(seam != 0 && first != heard.end() && first != heard.begin());
+        CHECK(first->at == seam && (first - 1)->block == first->block && !(first - 1)->playing && (first - 1)->at + (first - 1)->frames == seam);
+    }
+    {   // The same in the older dispatch, which renders each track up to each step: heard once, asleep under its print
+        std::vector<uint32_t> asleep(blocks);
+        auto frozen = run(pack(), [&](EngineHost& host, unsigned b) {
+            if (!b) host.set_one_dispatch(false);
+            if (b) asleep[b - 1] = host.sleeping_tracks() & 1;
+        });
+        CHECK(differ(live, frozen) == 0);
+        CHECK(frozen.plugin->heard_playing == 0 && asleep[blocks - 2]);
+    }
+    {   // A frozen track that is stopped (off in the sequence links until a launch): it hears the song stopped too, so
+        // nothing of it sounds and its engine sleeps, however soon it fell asleep
+        auto off = std::make_unique<Project>(*project);
+        off->tracks[0].off = true;
+        std::vector<uint32_t> asleep(blocks);
+        auto frozen = run(pack(), [&](EngineHost& host, unsigned b) { if (b) asleep[b - 1] = host.sleeping_tracks() & 1; }, off.get());
+        CHECK(frozen.plugin->heard_playing == 0 && peak_of(frozen.l) == 0 && asleep[blocks - 2]);
+    }
+    {   // One plug-in on two tracks, one of them frozen and one live: it hears the song play throughout (as the live
+        // track has it), not Play and Stop by turns
+        auto both = std::make_unique<Project>(*project);
+        synth(both->tracks[1], 0);
+        auto frozen = run(pack(), {}, both.get());
+        CHECK(frozen.plugin->heard_playing > 0 && frozen.plugin->heard_stopped == 0);
+    }
+    {   // Unfreeze in the second pass: the print fades out (a few milliseconds) and the plug-in plays on where the song
+        // is, as it does unfrozen
+        const unsigned thaw = unsigned(pass * 3 / 2 / 128);
+        auto frozen = run(pack(), [&](EngineHost& host, unsigned b) {
+            if (b == thaw) host.send({Command::Type::Freeze, 0});
+        });
+        CHECK(frozen.host->frozen_tracks() == 0 && frozen.plugin->heard_playing > 0);
+        CHECK(differ(live, frozen, size_t(thaw) * 128 + size_t(rate / 20)) == 0);
+    }
+    std::puts("freeze self-playing ok");
+}
+
 // Pad sends, freeze: a kit's print carries its pads' sends in a pair a bus (A and C here), cut to the print's frames;
 // a frozen kit plays them into its buses as the live kit sends, at its level, so what the buses hear is the same.
 void pad_sends_freeze() {
@@ -10323,6 +10486,7 @@ int main() {
     capture_p5();
     prints_f2a();
     freeze_f2b();
+    freeze_self_playing();
     audio_track_playback();
     audio_warp();
     exports_p4();

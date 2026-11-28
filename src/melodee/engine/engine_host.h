@@ -426,6 +426,11 @@ private:
     const bool is_lean = false;
     EffectClock own_clock;                // a print host's
     EffectClock* fx_clock = &effect_clock; // the clock its effects hear: the live one, or own_clock
+    // Freeze plan F2b: the clock a frozen track's engine hears while its print plays in its place (Slot::hears_stop), this
+    // block's with the song stopped (as TRANSPORT off has it: the tempo and the place, never Play). A plug-in that
+    // plays by itself (a sequencer or an arpeggiator of its own) then stops as it does on Stop, rather than playing
+    // under its print.
+    EffectClock held_clock;
     struct PendingOff { int32_t key = -1; int32_t samples = 0; }; // a pad's key, with an instrument's semitones over it
     struct PendingOn { int32_t key = -1; int16_t velocity = 0; int32_t from = -1; int32_t samples = 0, length = 0; }; // an arp note swung late
     // A ratchet's hit still to come (roadmap P1): `samples` frames on it plays `key` (as the engine plays it; a kit
@@ -551,6 +556,13 @@ private:
         FreezePack* freeze_leaving = nullptr;
         bool print_on = false, awake = true, print_post = true; // print_post: its prints' tap (kept for a fade's end)
         uint32_t quiet = 0;
+        // Its engine hears the song stopped (held_clock): frozen, and its print playing in its place or the track
+        // stopped (a STOP, a song row without it), unless a track playing live shares its plug-in (`shared`, which
+        // would hear Play and Stop by turns). `hears_stop` as it is now, `stop_from` at the block's start, and the frames it
+        // changed on since (a block played in one dispatch renders after it is sequenced: each part hears its own).
+        bool hears_stop = false, stop_from = false, shared = false;
+        uint8_t stop_count = 0;
+        std::array<uint16_t, 4> stop_frames {};
         std::bitset<256> hand {};
         float* print_l = nullptr;
         float* print_r = nullptr;
@@ -573,7 +585,8 @@ private:
     void engine_bend(Slot& slot, float value); // -1..1
     void engine_pressure(Slot& slot, int key, float value);
     void make_call(unsigned t, Slot& slot, const EngineCall& call); // one kept call, now
-    void render_engine(unsigned t, Slot& slot, unsigned at, unsigned frames); // the engine's frames [at, at + frames)
+    void render_engine(unsigned t, Slot& slot, unsigned at, unsigned frames, bool stopped = false); // the engine's frames [at, at + frames)
+    void follow_stop(Slot& slot, unsigned at, bool whole); // freeze plan F2b: whether its engine hears the song stopped
     void play_calls(unsigned t, Slot& slot, unsigned frames);   // the engine over the whole block, each call at its frame
     std::atomic<bool> whole_blocks {true};
     int keyed_pad = -1;                            // this block's: the Sidechain's key track, when its key is one kit pad
